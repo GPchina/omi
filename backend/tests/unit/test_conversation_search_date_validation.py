@@ -35,6 +35,8 @@ class _AutoMockModule(ModuleType):
         return mock
 
 
+from testing.import_isolation import package_submodule_stubs
+
 _stubs = [
     'ulid',
     'pinecone',
@@ -54,17 +56,19 @@ _stubs = [
     'google.cloud.firestore',
     'google.cloud.firestore_v1',
     'utils.request_validation',
+    # routers.conversations resolves the client population for its journey
+    # metric; utils is an _AutoMockModule package here, so the real submodule
+    # is not importable and the name has to be stubbed like the rest.
+    'utils.journey_metrics_contract',
     'utils.other.endpoints',
+    'utils.other.list_budget',
     'utils.other.storage',
-    'utils.conversations.factory',
-    'utils.conversations.analytics',
-    'utils.conversations.render',
-    'utils.conversations.process_conversation',
-    'utils.conversations.search',
-    'utils.conversations.calendar_linking',
-    'utils.conversations.calendar_utils',
-    'utils.conversations.location',
+    # Names only: this file's _AutoMockModule/_register_module wrap them. Parents
+    # (including utils.conversations) are created by _register_module, so the
+    # package itself is omitted here. See package_submodule_stubs.
+    *sorted(package_submodule_stubs('utils.conversations', include_package=False)),
     'utils.executors',
+    'utils.product_telemetry',
     'utils.llm.conversation_processing',
     'utils.speaker_identification',
     'utils.app_integrations',
@@ -135,6 +139,10 @@ for _mod_name in _stubs:
 
 sys.modules['firebase_admin.auth'].InvalidIdTokenError = type('InvalidIdTokenError', (Exception,), {})
 
+# A MagicMock client kind would make every downstream assertion unreadable, so the
+# resolver returns a real bounded value and the finalization test asserts it arrives.
+sys.modules['utils.journey_metrics_contract'].resolve_client_kind = lambda *_a, **_k: 'mobile_ios'
+
 # utils.other.endpoints exposes the auth dependencies used in route signatures; FastAPI needs
 # real callables to build the dependants, so provide small stand-ins.
 _endpoints = ModuleType('utils.other.endpoints')
@@ -183,6 +191,19 @@ _register_module('utils.memory.canonical_activation', _canonical_activation_stub
 _retraction_scope_stub = ModuleType('utils.memory.retraction_scope')
 setattr(_retraction_scope_stub, 'retraction_can_be_skipped', MagicMock(return_value=False))
 _register_module('utils.memory.retraction_scope', _retraction_scope_stub)
+
+# The router imports the typed conflict raised by exhausted cascade-retract CAS
+# retries (#11726); expose it as a real RuntimeError subclass so the
+# except-clause in delete_conversation binds to something concrete.
+_canonical_adapter_stub = ModuleType('utils.memory.canonical_memory_adapter')
+
+
+class _ConversationReplacementConflictError(RuntimeError):
+    pass
+
+
+setattr(_canonical_adapter_stub, 'ConversationReplacementConflictError', _ConversationReplacementConflictError)
+_register_module('utils.memory.canonical_memory_adapter', _canonical_adapter_stub)
 
 _apps_stub = ModuleType('utils.apps')
 setattr(_apps_stub, 'get_available_app_by_id_with_reviews', MagicMock())
@@ -472,6 +493,7 @@ def test_finalize_conversation_persists_durable_work_and_returns_without_process
         force_process=True,
         extra_updates=None,
         require_cloud_tasks=True,
+        client_kind='mobile_ios',
     )
     remove_pointer.assert_called_once_with('test-uid')
     process.assert_not_called()
@@ -683,6 +705,7 @@ def test_finalization_status_endpoint_exposes_retryable_durable_state():
         'retryable': True,
         'attempt_count': 2,
         'task_retry_count': 1,
+        'meeting_treatment_eligible': False,
     }
     with (
         patch.object(conv.conversations_db, 'get_conversation', return_value={'id': 'conv-1'}),

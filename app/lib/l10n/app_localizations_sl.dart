@@ -322,7 +322,7 @@ class AppLocalizationsSl extends AppLocalizations {
   String get searchApps => 'Iskanje aplikacij...';
 
   @override
-  String get myApps => 'Moje aplikacije';
+  String get myApps => 'Ustvarjeno od mene';
 
   @override
   String get installedApps => 'Nameščene aplikacije';
@@ -9877,4 +9877,43 @@ class AppLocalizationsSl extends AppLocalizations {
   @override
   String get sendRawAudioToOmiDescription =>
       'Izklopite, da preprečite pošiljanje neobdelanega zvoka v Omi. Prepisi in podatki, potrebni za funkcije v oblaku, se lahko še vedno pošiljajo v Omi.';
+
+  @override
+  String get findDevice => 'Poišči';
+
+  @override
+  String get diagnosticsShareFailed => 'Diagnostike ni bilo mogoče deliti. Poskusi znova.';
+
+  @override
+  String get appDisabledTitle => 'Ta aplikacija je onemogočena in je ni mogoče namestiti.';
+
+  @override
+  String get appDisabledWebhookFailures =>
+      'Njena končna točka je odpovedovala 72 ur zapored, zato je bila dostava ustavljena.';
+
+  @override
+  String get appDisabledGeneric => 'Onemogočila jo je Omi.';
+
+  @override
+  String get appDisabledOwnerHint =>
+      'Najprej popravi končno točko — ponovna omogočitev znova preveri vsak nastavljen URL.';
+
+  @override
+  String get appReEnable => 'Znova omogoči';
+
+  @override
+  String get appReEnableFailedTitle => 'Ponovna omogočitev ni uspela';
+
+  @override
+  String get appReEnableFailedBody => 'Te aplikacije ni bilo mogoče znova omogočiti. Poskusi znova.';
+
+  @override
+  String appDisabledOn(String date) {
+    return 'Onemogočeno $date.';
+  }
+
+  @override
+  String appDisabledLastError(String error) {
+    return 'Zadnja napaka: $error.';
+  }
 }

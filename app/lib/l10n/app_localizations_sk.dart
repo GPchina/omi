@@ -323,7 +323,7 @@ class AppLocalizationsSk extends AppLocalizations {
   String get searchApps => 'Hľadať aplikácie...';
 
   @override
-  String get myApps => 'Moje aplikácie';
+  String get myApps => 'Vytvorené mnou';
 
   @override
   String get installedApps => 'Nainštalované aplikácie';
@@ -9840,4 +9840,42 @@ class AppLocalizationsSk extends AppLocalizations {
   @override
   String get sendRawAudioToOmiDescription =>
       'Vypnutím zabránite odosielaniu nespracovaného zvuku do Omi. Prepisy a údaje potrebné pre cloudové funkcie sa môžu naďalej odosielať do Omi.';
+
+  @override
+  String get findDevice => 'Nájsť';
+
+  @override
+  String get diagnosticsShareFailed => 'Diagnostiku sa nepodarilo zdieľať. Skús to znova.';
+
+  @override
+  String get appDisabledTitle => 'Táto aplikácia je vypnutá a nedá sa nainštalovať.';
+
+  @override
+  String get appDisabledWebhookFailures => 'Jej endpoint zlyhával 72 hodín v kuse, preto bolo doručovanie zastavené.';
+
+  @override
+  String get appDisabledGeneric => 'Vypla ju Omi.';
+
+  @override
+  String get appDisabledOwnerHint =>
+      'Najskôr oprav endpoint — pri opätovnom zapnutí sa znovu overí každá nastavená URL.';
+
+  @override
+  String get appReEnable => 'Znovu zapnúť';
+
+  @override
+  String get appReEnableFailedTitle => 'Nepodarilo sa znovu zapnúť';
+
+  @override
+  String get appReEnableFailedBody => 'Túto aplikáciu sa nepodarilo znovu zapnúť. Skús to znova.';
+
+  @override
+  String appDisabledOn(String date) {
+    return 'Vypnuté $date.';
+  }
+
+  @override
+  String appDisabledLastError(String error) {
+    return 'Posledná chyba: $error.';
+  }
 }

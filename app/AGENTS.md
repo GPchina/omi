@@ -111,7 +111,7 @@ PR CI runs `flutter test` and an analyzer ratchet (`app/scripts/analyze_ratchet.
 ### Token Lifecycle
 1. `getAuthHeader()` in `lib/backend/http/shared.dart` checks token expiry (5-minute buffer)
 2. If expired, calls `AuthService.instance.getIdToken()` for Firebase refresh
-3. Token stored in SharedPreferencesUtil with expiration timestamp
+3. Token stored via SharedPreferencesUtil in flutter_secure_storage (Keychain / EncryptedSharedPreferences); expiration timestamp stays in SharedPreferences. One-time migrateAuthTokenFromPrefs() runs at SharedPreferencesUtil.init() so existing sessions keep their token.
 4. 401 responses trigger automatic refresh + retry
 
 ### Auth Methods
@@ -125,7 +125,6 @@ All API requests include: X-Request-Start-Time, X-App-Platform, X-Device-Id-Hash
 ### API Base URLs
 - Dev: configured in `.dev.env` → `Env.apiBaseUrl`
 - Prod: configured in `.prod.env` → `Env.apiBaseUrl`
-- Agent proxy WS: derived from apiBaseUrl (api.omi.me → agent.omi.me)
 
 ## Codegen Rules
 
