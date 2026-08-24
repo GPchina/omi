@@ -1,0 +1,53 @@
+name: DevKit Firmware Build (XIAO nRF52840 Sense)
+
+# Builds Omi DevKit firmware targets for the Seeed XIAO nRF52840 Sense board
+# using the Zephyr CI docker image + nRF Connect SDK v2.7.0 (the version
+# required by omi/firmware/devkit per docs.omi.me Compile_firmware).
+# Produces zephyr.uf2 (drag-and-drop flash via UF2 bootloader).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI_IMAGE: ghcr.io/zephyrproject-rtos/ci:v0.26.13@sha256:b0ac6334d1926cd0971a0a444f7adc6dd020e88ee3ce865aa070b6475a3ac4eb
+  NCS_VERSION: v2.7.0
+
+jobs:
+  build-devkit:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [devkitv1-spisd, devkitv2-adafruit]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware in Zephyr CI container
+        run: |
+          docker pull "$CI_IMAGE"
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" "$CI_IMAGE" bash -eux -c '
+            git config --global --add safe.directory /src &&
+            git config --global user.email ci@local &&
+            git config --global user.name ci &&
+            west init -m https://github.com/nrfconnect/sdk-nrf --mr '"$NCS_VERSION"' /opt/ncs &&
+            cd /opt/ncs &&
+            west update &&
+            cd /src/omi/firmware/devkit &&
+            export ZEPHYR_BASE=/opt/ncs/zephyr &&
+            west build -b xiao_ble_sense -p always -d build/${{ matrix.target }} -- \
+              -DCONF_FILE=prj_xiao_ble_sense_${{ matrix.target }}.conf \
+              -DDTC_OVERLAY_FILE=overlay/xiao_ble_sense_${{ matrix.target }}.overlay \
+              -DBOARD=xiao_ble_sense
+          '
+
+      - name: Upload UF2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omi-${{ matrix.target }}-uf2
+          path: ${{ github.workspace }}/omi/firmware/devkit/build/${{ matrix.target }}/zephyr/zephyr.uf2
+          if-no-files-found: error
