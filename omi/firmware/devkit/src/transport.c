@@ -735,6 +735,13 @@ void pusher(void)
                 }
                 k_mutex_unlock(&write_sdcard_mutex);
             }
+            if (!is_sd_on() && !ring_buf_is_empty(&ring_buf)) {
+                // No SD card: discard stale audio frames so the ring buffer never fills.
+                // A full ring buffer triggers an error-log flood (LOG_MODE_IMMEDIATE, ~100Hz)
+                // that starves the main thread and causes a watchdog reset while a central
+                // is connected but not yet subscribed (e.g. slow Windows GATT discovery).
+                read_from_tx_queue();
+            }
             if (result) {
                 heartbeat_count++;
                 if (heartbeat_count == 255) {
