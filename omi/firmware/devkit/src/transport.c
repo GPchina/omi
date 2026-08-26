@@ -752,6 +752,14 @@ void pusher(void)
             } else {
             }
         }
+        if (!valid && !is_sd_on() && !ring_buf_is_empty(&ring_buf)) {
+            // storage_is_on is set true by the connected callback, so the branch above
+            // is skipped while connected-but-not-subscribed (e.g. slow Windows GATT
+            // discovery). That also leaves the ring buffer undrained. Discard stale
+            // frames in EVERY unsubscribed state when no SD card is present, or the
+            // error-log flood starves the CPU and the watchdog resets mid-discovery.
+            read_from_tx_queue();
+        }
         if (valid) {
             bool sent = push_to_gatt(conn);
             if (!sent) {
