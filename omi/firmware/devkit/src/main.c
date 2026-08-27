@@ -38,7 +38,19 @@ static void mic_handler(int16_t *buffer)
 
 void bt_ctlr_assert_handle(char *name, int type)
 {
+    // Crash beacon: the SoftDevice Controller asserted (suspected llcp stall
+    // during connect-time procedures). The deferred log thread is typically
+    // already wedged by then, so a log line would be invisible. Blink the red
+    // LED fast forever instead, feeding the watchdog so the pattern persists
+    // and is clearly distinct from a watchdog reset (which would stop it).
     LOG_INF("Bluetooth assert: %s (type %d)", name ? name : "NULL", type);
+    while (1) {
+        set_led_red(true);
+        k_busy_wait(100 * 1000);
+        set_led_red(false);
+        k_busy_wait(100 * 1000);
+        watchdog_feed();
+    }
 }
 
 static void print_reset_reason(void)
