@@ -346,8 +346,13 @@ int main(void)
     LOG_PRINTK("\n");
     LOG_INF("Device initialized successfully\n");
 
+    // Feed the watchdog during the boot demo sequence: the only regular feed is
+    // in the main loop below. With no SD card the pre-pusher error burst can
+    // wedge the console and hang this section past the 30s timeout.
+    watchdog_feed();
     set_led_blue(true);
     k_msleep(1000);
+    watchdog_feed();
     set_led_blue(false);
 
     // Main loop
