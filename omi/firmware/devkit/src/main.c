@@ -157,7 +157,7 @@ int main(void)
     // Firmware version fingerprint: printed at boot AND shown as blue LED
     // blink count, so the running build can be verified beyond doubt even
     // when the log pipe dies later. Bump on every patch!
-    LOG_INF("FW VERSION: P8\n");
+    LOG_INF("FW VERSION: P9\n");
 
     LOG_INF("Model: %s", CONFIG_BT_DIS_MODEL);
     LOG_INF("Firmware revision: %s", CONFIG_BT_DIS_FW_REV_STR);
@@ -181,9 +181,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 8 times = patch 8. Visible without any
+    // Version blink: blue LED blinks 9 times = patch 9. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
