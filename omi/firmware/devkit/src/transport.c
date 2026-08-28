@@ -564,7 +564,11 @@ static bool read_from_tx_queue()
                      tx_buffer,
                      (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)); // It always fits completely or not at all
     if (tx_buffer_size != (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)) {
-        LOG_ERR("Failed to read from ring buffer. not enough data %d", tx_buffer_size);
+        // P8: demoted from LOG_ERR to LOG_DBG. In deferred log mode this is a
+        // normal transient condition (pusher spins faster than codec fills the
+        // ring buffer) and the old error flooded the log pipe with thousands
+        // of messages/sec, hiding real errors. BLE audio path unaffected.
+        LOG_DBG("Failed to read from ring buffer. not enough data %d", tx_buffer_size);
         return false;
     }
 
