@@ -55,11 +55,11 @@ static void button_ccc_config_changed_handler(const struct bt_gatt_attr *attr, u
         LOG_ERR("Invalid CCC value: %u", value);
     }
 }
-struct gpio_dt_spec d4_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-                              .pin = 4,
-                              .dt_flags = GPIO_OUTPUT_ACTIVE}; // 3.3
-struct gpio_dt_spec d5_pin_input = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-                                    .pin = 5,
+// Button wiring (custom build): one leg to D3 (P0.29), the other to GND.
+// Internal pull-up keeps the pin high when idle; pressing pulls it low.
+// (Stock omi used D4 output + D5 input - not our wiring.)
+struct gpio_dt_spec d3_pin_input = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
+                                    .pin = 29,
                                     .dt_flags = GPIO_INT_EDGE_RISING};
 
 static bool was_pressed = false;
@@ -69,7 +69,7 @@ static bool was_pressed = false;
 //
 void button_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    int temp = gpio_pin_get_raw(dev, d5_pin_input.pin);
+    int temp = gpio_pin_get_raw(dev, d3_pin_input.pin);
     LOG_PRINTK("button_pressed_callback %d\n", temp);
     if (temp) {
         was_pressed = false;
@@ -452,45 +452,33 @@ static ssize_t button_data_read_characteristic(struct bt_conn *conn,
 
 int button_init()
 {
-    if (gpio_is_ready_dt(&d4_pin)) {
-        LOG_INF("D4 Pin ready");
+    if (gpio_is_ready_dt(&d3_pin_input)) {
+        LOG_INF("D3 Pin ready");
     } else {
-        LOG_ERR("Error setting up D4 Pin");
-        return -1;
-    }
-    if (gpio_pin_configure_dt(&d4_pin, GPIO_OUTPUT_ACTIVE) < 0) {
-        LOG_ERR("Error setting up D4 Pin Voltage");
-        return -1;
-    } else {
-        LOG_INF("D4 ready to transmit voltage");
-    }
-    if (gpio_is_ready_dt(&d5_pin_input)) {
-        LOG_INF("D5 Pin ready");
-    } else {
-        LOG_ERR("D5 Pin not ready");
+        LOG_ERR("D3 Pin not ready");
         return -1;
     }
 
-    int err2 = gpio_pin_configure_dt(&d5_pin_input, GPIO_INPUT);
+    int err2 = gpio_pin_configure_dt(&d3_pin_input, GPIO_INPUT | GPIO_PULL_UP);
 
     if (err2 != 0) {
-        LOG_ERR("Error setting up D5 Pin");
+        LOG_ERR("Error setting up D3 Pin");
         return -1;
     } else {
-        LOG_INF("D5 ready");
+        LOG_INF("D3 ready (internal pull-up)");
     }
     // GPIO_INT_LEVEL_INACTIVE
-    err2 = gpio_pin_interrupt_configure_dt(&d5_pin_input, GPIO_INT_EDGE_BOTH);
+    err2 = gpio_pin_interrupt_configure_dt(&d3_pin_input, GPIO_INT_EDGE_BOTH);
 
     if (err2 != 0) {
-        LOG_ERR("D5 unable to detect button presses");
+        LOG_ERR("D3 unable to detect button presses");
         return -1;
     } else {
-        LOG_INF("D5 ready to detect button presses");
+        LOG_INF("D3 ready to detect button presses");
     }
 
-    gpio_init_callback(&button_cb_data, button_pressed_callback, BIT(d5_pin_input.pin));
-    gpio_add_callback(d5_pin_input.port, &button_cb_data);
+    gpio_init_callback(&button_cb_data, button_pressed_callback, BIT(d3_pin_input.pin));
+    gpio_add_callback(d3_pin_input.port, &button_cb_data);
 
     return 0;
 }
@@ -522,8 +510,8 @@ void turnoff_all()
     set_led_blue(false);
     set_led_red(false);
     set_led_green(false);
-    gpio_remove_callback(d5_pin_input.port, &button_cb_data);
-    gpio_pin_interrupt_configure_dt(&d5_pin_input, GPIO_INT_LEVEL_INACTIVE);
+    gpio_remove_callback(d3_pin_input.port, &button_cb_data);
+    gpio_pin_interrupt_configure_dt(&d3_pin_input, GPIO_INT_LEVEL_INACTIVE);
 
     // Disable watchdog before entering system off
     int rc = watchdog_deinit();
