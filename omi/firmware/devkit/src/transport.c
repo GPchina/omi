@@ -48,6 +48,7 @@ static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         uint8_t flags);
 
 static struct bt_conn_cb _callback_references;
+static struct bt_gatt_cb _gatt_callbacks;
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t audio_data_read_characteristic(struct bt_conn *conn,
                                               const struct bt_gatt_attr *attr,
@@ -500,12 +501,16 @@ static void _att_mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
     }
 }
 
+/* NOTE: att_mtu_updated is a bt_gatt_cb member, NOT a bt_conn_cb member. */
+static struct bt_gatt_cb _gatt_callbacks = {
+    .att_mtu_updated = _att_mtu_updated,
+};
+
 static struct bt_conn_cb _callback_references = {
     .connected = _transport_connected,
     .disconnected = _transport_disconnected,
     .le_param_req = _le_param_req,
     .le_param_updated = _le_param_updated,
-    .att_mtu_updated = _att_mtu_updated,
 #if defined(CONFIG_BT_PHY_UPDATE)
     .le_phy_updated = _le_phy_updated,
 #endif
@@ -858,6 +863,7 @@ int transport_start()
 
     // Configure callbacks
     bt_conn_cb_register(&_callback_references);
+    bt_gatt_cb_register(&_gatt_callbacks);
 
     // Enable Bluetooth
     int err = bt_enable(NULL);
