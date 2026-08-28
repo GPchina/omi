@@ -415,14 +415,16 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
         bt_conn_unref(current_connection);
     }
     current_connection = bt_conn_ref(conn);
-#if defined(CONFIG_BT_DATA_LEN_UPDATE)
-    current_mtu = info.le.data_len->tx_max_len;
-#else
-    /* DLE disabled (Windows interop bring-up): LL PDUs stay at the default
-     * 27-byte length. Keep current_mtu valid for the notify path. */
-    current_mtu = 27;
-#endif
-    LOG_INF("Transport connected");
+    /* Use the negotiated ATT MTU for the notify path, not the LE data
+     * length. The original code used info.le.data_len->tx_max_len as
+     * "current_mtu", which is only valid while DLE is enabled (251).
+     * With DLE disabled for Windows bring-up, data_len is 27 and the pusher
+     * gate (current_mtu < MINIMAL_PACKET_SIZE) would silence audio forever.
+     * bt_gatt_get_mtu() returns the real ATT MTU (498 here); it starts at
+     * 23 and _att_mtu_updated() raises it once the central's MTU exchange
+     * completes. The pusher stays silent until then, which is correct. */
+    current_mtu = bt_gatt_get_mtu(conn);
+    LOG_INF("Transport connected (att_mtu=%d)", current_mtu);
     LOG_DBG("Interval: %d, latency: %d, timeout: %d", info.le.interval, info.le.latency, info.le.timeout);
 #if defined(CONFIG_BT_PHY_UPDATE)
     LOG_DBG("TX PHY %s, RX PHY %s", phy2str(info.le.phy->tx_phy), phy2str(info.le.phy->rx_phy));
@@ -490,11 +492,20 @@ static void _le_data_length_updated(struct bt_conn *conn, struct bt_conn_le_data
 }
 #endif
 
+static void _att_mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
+{
+    LOG_INF("ATT MTU updated: tx=%d rx=%d", tx, rx);
+    if (conn == current_connection) {
+        current_mtu = tx;
+    }
+}
+
 static struct bt_conn_cb _callback_references = {
     .connected = _transport_connected,
     .disconnected = _transport_disconnected,
     .le_param_req = _le_param_req,
     .le_param_updated = _le_param_updated,
+    .att_mtu_updated = _att_mtu_updated,
 #if defined(CONFIG_BT_PHY_UPDATE)
     .le_phy_updated = _le_phy_updated,
 #endif
