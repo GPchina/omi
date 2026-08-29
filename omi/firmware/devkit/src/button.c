@@ -516,6 +516,23 @@ void turnoff_all()
     // can only be exited via reset/USB replug.
     nrf_gpio_cfg_sense_input(d3_pin_input.pin, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
 
+    // P12: wait for the button to be RELEASED before entering System OFF.
+    // The long-press handler fires at the 3s mark while the finger is still
+    // holding the button down - D3 is LOW at that instant, and SYSTEMOFF with
+    // SENSE_LOW already active wakes up immediately (instant reboot loop).
+    // Block here until the pin reads released (high) for a stable 200ms window.
+    LOG_INF("Waiting for button release before System OFF");
+    int stable = 0;
+    while (stable < 20) {
+        if (gpio_pin_get_raw(d3_pin_input.port, d3_pin_input.pin) > 0) {
+            stable++;
+        } else {
+            stable = 0;
+        }
+        k_msleep(10);
+    }
+    k_msleep(50);
+
     NRF_POWER->SYSTEMOFF = 1;
 }
 
