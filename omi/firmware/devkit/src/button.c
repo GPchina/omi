@@ -25,7 +25,6 @@ static ssize_t button_data_read_characteristic(struct bt_conn *conn,
                                                void *buf,
                                                uint16_t len,
                                                uint16_t offset);
-static struct gpio_callback button_cb_data;
 
 static struct bt_uuid_128 button_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x23BA7924, 0x0000, 0x1000, 0x7450, 0x346EAC492E92));
@@ -58,25 +57,13 @@ static void button_ccc_config_changed_handler(const struct bt_gatt_attr *attr, u
 // Button wiring (custom build): one leg to D3 (P0.29), the other to GND.
 // Internal pull-up keeps the pin high when idle; pressing pulls it low.
 // (Stock omi used D4 output + D5 input - not our wiring.)
+// P10: POLLING ONLY - no GPIO interrupt. A bouncing button wire on the flying
+// leads caused an EDGE_BOTH interrupt storm that starved the SoftDevice
+// controller init (P9 hung at bt_sdc_hci with zero serial output).
+// check_button_level() reads the pin directly at 25 Hz instead.
 struct gpio_dt_spec d3_pin_input = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
                                     .pin = 29,
-                                    .dt_flags = GPIO_INT_EDGE_RISING};
-
-static bool was_pressed = false;
-
-//
-// button
-//
-void button_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    int temp = gpio_pin_get_raw(dev, d3_pin_input.pin);
-    LOG_PRINTK("button_pressed_callback %d\n", temp);
-    if (temp) {
-        was_pressed = false;
-    } else {
-        was_pressed = true;
-    }
-}
+                                    .dt_flags = 0};
 #define BUTTON_CHECK_INTERVAL 40 // 0.04 seconds, 25 Hz
 
 void check_button_level(struct k_work *work_item);
@@ -180,7 +167,9 @@ void check_button_level(struct k_work *work_item)
 {
     current_time = current_time + 1;
 
-    u_int8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
+    // Poll the pin directly: idle = high (internal pull-up), pressed = low (wired to GND).
+    int raw = gpio_pin_get_raw(d3_pin_input.port, d3_pin_input.pin);
+    u_int8_t btn_state = (raw == 0) ? BUTTON_PRESSED : BUTTON_RELEASED;
 
     ButtonEvent event = BUTTON_EVENT_NONE;
 
@@ -467,18 +456,10 @@ int button_init()
     } else {
         LOG_INF("D3 ready (internal pull-up)");
     }
-    // GPIO_INT_LEVEL_INACTIVE
-    err2 = gpio_pin_interrupt_configure_dt(&d3_pin_input, GPIO_INT_EDGE_BOTH);
-
-    if (err2 != 0) {
-        LOG_ERR("D3 unable to detect button presses");
-        return -1;
-    } else {
-        LOG_INF("D3 ready to detect button presses");
-    }
-
-    gpio_init_callback(&button_cb_data, button_pressed_callback, BIT(d3_pin_input.pin));
-    gpio_add_callback(d3_pin_input.port, &button_cb_data);
+    // P10: polling-only button. No GPIO interrupt is configured on purpose -
+    // a bouncing flying lead triggered an EDGE_BOTH interrupt storm that
+    // starved the BLE controller init. check_button_level() polls at 25 Hz.
+    LOG_INF("D3 polling mode (no GPIO interrupt)");
 
     return 0;
 }
@@ -510,8 +491,7 @@ void turnoff_all()
     set_led_blue(false);
     set_led_red(false);
     set_led_green(false);
-    gpio_remove_callback(d3_pin_input.port, &button_cb_data);
-    gpio_pin_interrupt_configure_dt(&d3_pin_input, GPIO_INT_LEVEL_INACTIVE);
+    // P10: no GPIO callback/interrupt to tear down (polling-only button).
 
     // Disable watchdog before entering system off
     int rc = watchdog_deinit();
