@@ -10,6 +10,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/poweroff.h>
 
+#include <hal/nrf_gpio.h>
+
 #include "led.h"
 #include "mic.h"
 #include "sdcard.h"
@@ -216,6 +218,12 @@ void check_button_level(struct k_work *work_item)
         LOG_PRINTK("single tap detected\n");
         btn_last_event = event;
         notify_tap();
+
+        // P11: visible feedback so taps are observable even with no app connected
+        // (official firmware only notifies the phone; locally nothing happened).
+        set_led_green(true);
+        k_msleep(150);
+        set_led_green(false);
     }
 
     // Double tap
@@ -501,6 +509,13 @@ void turnoff_all()
 
     // maybe save something here to indicate success. next time the button is pressed we should know about it
     NRF_USBD->INTENCLR = 0xFFFFFFFF;
+
+    // P11: configure D3 (P0.29) as the System OFF wake source before pulling the plug.
+    // Pull-up + SENSE_LOW: pin idles high, pressing the button drives it low and the
+    // DETECT signal wakes the chip (it resets and reboots). Without this, SYSTEMOFF
+    // can only be exited via reset/USB replug.
+    nrf_gpio_cfg_sense_input(d3_pin_input.pin, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
+
     NRF_POWER->SYSTEMOFF = 1;
 }
 
