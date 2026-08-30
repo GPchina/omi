@@ -45,6 +45,34 @@ static void mic_handler(int16_t *buffer)
     }
 }
 
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+// P13b: SD mount worker thread. See the call site in main() for the rationale.
+K_THREAD_STACK_DEFINE(sd_mount_stack, 8192);
+static struct k_thread sd_mount_thread_data;
+
+static void sd_mount_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+
+    int err = mount_sd_card();
+    if (err) {
+        // Degrade, never abort: BLE + button keep working, manual recording
+        // just won't write anything until a card mounts.
+        LOG_ERR("SD mount failed (err %d) - continuing WITHOUT storage", err);
+        return;
+    }
+
+    k_msleep(500);
+    LOG_INF("Initializing storage...\n");
+    err = storage_init();
+    if (err) {
+        LOG_ERR("storage_init failed (err %d)", err);
+    }
+}
+#endif
+
 void bt_ctlr_assert_handle(char *name, int type)
 {
     // Crash beacon: the SoftDevice Controller asserted (suspected llcp stall
@@ -178,7 +206,7 @@ int main(void)
     // Firmware version fingerprint: printed at boot AND shown as blue LED
     // blink count, so the running build can be verified beyond doubt even
     // when the log pipe dies later. Bump on every patch!
-    LOG_INF("FW VERSION: P13\n");
+    LOG_INF("FW VERSION: P13B\n");
 
     LOG_INF("Model: %s", CONFIG_BT_DIS_MODEL);
     LOG_INF("Firmware revision: %s", CONFIG_BT_DIS_FW_REV_STR);
@@ -202,9 +230,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 13 times = patch 13. Visible without any
+    // Version blink: blue LED blinks 14 times = patch 13b. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 13; i++) {
+    for (int i = 0; i < 14; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
@@ -270,26 +298,17 @@ int main(void)
     // Enable sdcard
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
     LOG_PRINTK("\n");
-    LOG_INF("Mount SD card...\n");
-
-    err = mount_sd_card();
-    if (err) {
-        // P13: do NOT abort boot on mount failure. Official firmware returns
-        // here, which kills the main loop -> watchdog reset loop -> brick.
-        // Degrade instead: BLE + button keep working, manual recording just
-        // won't write anything (pusher checks is_sd_on()).
-        LOG_ERR("Failed to mount SD card (err %d) - continuing WITHOUT storage", err);
-    } else {
-        k_msleep(500);
-
-        LOG_PRINTK("\n");
-        LOG_INF("Initializing storage...\n");
-
-        err = storage_init();
-        if (err) {
-            LOG_ERR("Failed to initialize storage (err %d)", err);
-        }
-    }
+    // P13b: mount in a dedicated lowest-priority thread. On the fly-wired
+    // module disk_access_init() was observed to spin without ever yielding,
+    // starving the (lower) log thread and the watchdog feed in the main loop
+    // below -> 30s watchdog reset boot loop, BLE never came up. At lowest
+    // priority with timeslicing the worst case is wasted CPU: boot, BLE and
+    // buttons keep working and the mount result is still visible on serial.
+    LOG_INF("Mounting SD card in background thread...\n");
+    k_thread_create(&sd_mount_thread_data, sd_mount_stack,
+                    K_THREAD_STACK_SIZEOF(sd_mount_stack),
+                    sd_mount_thread_fn, NULL, NULL, NULL,
+                    K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
 #endif
 
     // Enable haptic
