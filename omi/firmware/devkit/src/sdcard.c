@@ -39,42 +39,40 @@ bool sd_enabled = false;
 
 int mount_sd_card(void)
 {
-    // initialize the sd card enable pin (v2)
-    if (gpio_is_ready_dt(&sd_en_gpio_pin)) {
-        LOG_INF("SD Enable Pin ready");
-    } else {
-        LOG_ERR("Error setting up SD Enable Pin");
-        return -1;
-    }
-
-    if (gpio_pin_configure_dt(&sd_en_gpio_pin, GPIO_OUTPUT_ACTIVE) < 0) {
-        LOG_ERR("Error setting up SD Pin");
-        return -1;
-    }
+    // P13b: skip the sd_en (P0.19) pin on this fly-wire build. The module has
+    // no enable pin (power hardwired to 3V3), and P0.19 is claimed by the QSPI
+    // peripheral enabled in the v1-spisd overlay (qspi_default uses P0.19 as
+    // SCK) - configuring it as a GPIO output fought the QSPI pinctrl.
+    LOG_PRINTK("[SD] step 1/4: sd_en skipped (not present on fly-wire module)\n");
     sd_enabled = true;
 
     // initialize the sd card
+    LOG_PRINTK("[SD] step 2/4: disk_access_init (SPI probe - may block here)\n");
     const char *disk_pdrv = "SD";
     int err = disk_access_init(disk_pdrv);
-    LOG_INF("disk_access_init: %d\n", err);
+    LOG_PRINTK("[SD] disk_access_init: %d\n", err);
     if (err) { // reattempt
         k_msleep(1000);
+        LOG_PRINTK("[SD] step 2b: disk_access_init retry\n");
         err = disk_access_init(disk_pdrv);
+        LOG_PRINTK("[SD] disk_access_init retry: %d\n", err);
         if (err) {
             LOG_ERR("disk_access_init failed");
             return -1;
         }
     }
 
+    LOG_PRINTK("[SD] step 3/4: fs_mount\n");
     mount_point.mnt_point = "/SD:";
     int res = fs_mount(&mount_point);
     if (res == FR_OK) {
-        LOG_INF("SD card mounted successfully");
+        LOG_PRINTK("[SD] mounted OK\n");
     } else {
         LOG_ERR("f_mount failed: %d", res);
         return -1;
     }
 
+    LOG_PRINTK("[SD] step 4/4: audio dir\n");
     res = fs_mkdir("/SD:/audio");
 
     if (res == FR_OK) {
