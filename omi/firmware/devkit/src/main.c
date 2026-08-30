@@ -22,6 +22,15 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
 static void codec_handler(uint8_t *data, size_t len)
 {
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    // P13: only feed the transport when someone consumes the audio - a BLE
+    // central is connected, or a manual recording (button single tap) is
+    // active. When idle standalone, skip so the tx ring buffer does not fill
+    // up and drop every packet with error-log spam.
+    if (!should_capture_audio()) {
+        return;
+    }
+#endif
     int err = broadcast_audio_packets(data, len);
     if (err) {
         LOG_ERR("Failed to broadcast audio packets: %d", err);
@@ -128,6 +137,18 @@ void set_led_state()
         set_led_blue(false);
         return;
     }
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    // P13: manual recording indicator (standalone) - blink blue while
+    // recording to SD, distinguishable from idle (solid red) and from
+    // BLE-connected (solid blue).
+    if (!is_connected && is_manual_recording()) {
+        static bool rec_blink = false;
+        rec_blink = !rec_blink;
+        set_led_blue(rec_blink);
+        set_led_red(false);
+        return;
+    }
+#endif
     if (is_connected) {
         set_led_blue(true);
         set_led_red(false);
@@ -157,7 +178,7 @@ int main(void)
     // Firmware version fingerprint: printed at boot AND shown as blue LED
     // blink count, so the running build can be verified beyond doubt even
     // when the log pipe dies later. Bump on every patch!
-    LOG_INF("FW VERSION: P12\n");
+    LOG_INF("FW VERSION: P13\n");
 
     LOG_INF("Model: %s", CONFIG_BT_DIS_MODEL);
     LOG_INF("Firmware revision: %s", CONFIG_BT_DIS_FW_REV_STR);
@@ -181,9 +202,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 12 times = patch 12. Visible without any
+    // Version blink: blue LED blinks 13 times = patch 13. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 13; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
@@ -253,17 +274,21 @@ int main(void)
 
     err = mount_sd_card();
     if (err) {
-        LOG_ERR("Failed to mount SD card (err %d)", err);
-        return err;
-    }
-    k_msleep(500);
+        // P13: do NOT abort boot on mount failure. Official firmware returns
+        // here, which kills the main loop -> watchdog reset loop -> brick.
+        // Degrade instead: BLE + button keep working, manual recording just
+        // won't write anything (pusher checks is_sd_on()).
+        LOG_ERR("Failed to mount SD card (err %d) - continuing WITHOUT storage", err);
+    } else {
+        k_msleep(500);
 
-    LOG_PRINTK("\n");
-    LOG_INF("Initializing storage...\n");
+        LOG_PRINTK("\n");
+        LOG_INF("Initializing storage...\n");
 
-    err = storage_init();
-    if (err) {
-        LOG_ERR("Failed to initialize storage (err %d)", err);
+        err = storage_init();
+        if (err) {
+            LOG_ERR("Failed to initialize storage (err %d)", err);
+        }
     }
 #endif
 
