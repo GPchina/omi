@@ -76,6 +76,7 @@ static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         uint8_t flags);
 
 static struct bt_conn_cb _callback_references;
+static struct bt_gatt_cb _gatt_callbacks;
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t audio_data_read_characteristic(struct bt_conn *conn,
                                               const struct bt_gatt_attr *attr,
@@ -443,15 +444,27 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
         bt_conn_unref(current_connection);
     }
     current_connection = bt_conn_ref(conn);
-    current_mtu = info.le.data_len->tx_max_len;
-    LOG_INF("Transport connected");
+    /* Use the negotiated ATT MTU for the notify path, not the LE data
+     * length. The original code used info.le.data_len->tx_max_len as
+     * "current_mtu", which is only valid while DLE is enabled (251).
+     * With DLE disabled for Windows bring-up, data_len is 27 and the pusher
+     * gate (current_mtu < MINIMAL_PACKET_SIZE) would silence audio forever.
+     * bt_gatt_get_mtu() returns the real ATT MTU (498 here); it starts at
+     * 23 and _att_mtu_updated() raises it once the central's MTU exchange
+     * completes. The pusher stays silent until then, which is correct. */
+    current_mtu = bt_gatt_get_mtu(conn);
+    LOG_INF("Transport connected (att_mtu=%d)", current_mtu);
     LOG_DBG("Interval: %d, latency: %d, timeout: %d", info.le.interval, info.le.latency, info.le.timeout);
+#if defined(CONFIG_BT_PHY_UPDATE)
     LOG_DBG("TX PHY %s, RX PHY %s", phy2str(info.le.phy->tx_phy), phy2str(info.le.phy->rx_phy));
+#endif
+#if defined(CONFIG_BT_DATA_LEN_UPDATE)
     LOG_DBG("LE data len updated: TX (len: %d time: %d) RX (len: %d time: %d)",
             info.le.data_len->tx_max_len,
             info.le.data_len->tx_max_time,
             info.le.data_len->rx_max_len,
             info.le.data_len->rx_max_time);
+#endif
 
     k_work_schedule(&battery_work, K_MSEC(100)); // run immediately
 
@@ -487,12 +500,15 @@ static void _le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t 
     LOG_DBG("[ interval: %d, latency: %d, timeout: %d ]", interval, latency, timeout);
 }
 
+#if defined(CONFIG_BT_PHY_UPDATE)
 static void _le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
 {
     // LOG_DBG("LE PHY updated: TX PHY %s, RX PHY %s",
     //        phy2str(param->tx_phy), phy2str(param->rx_phy));
 }
+#endif
 
+#if defined(CONFIG_BT_DATA_LEN_UPDATE)
 static void _le_data_length_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info)
 {
     LOG_DBG("LE data len updated: TX (len: %d time: %d)"
@@ -503,14 +519,32 @@ static void _le_data_length_updated(struct bt_conn *conn, struct bt_conn_le_data
             info->rx_max_time);
     current_mtu = info->tx_max_len;
 }
+#endif
+
+static void _att_mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
+{
+    LOG_INF("ATT MTU updated: tx=%d rx=%d", tx, rx);
+    if (conn == current_connection) {
+        current_mtu = tx;
+    }
+}
+
+/* NOTE: att_mtu_updated is a bt_gatt_cb member, NOT a bt_conn_cb member. */
+static struct bt_gatt_cb _gatt_callbacks = {
+    .att_mtu_updated = _att_mtu_updated,
+};
 
 static struct bt_conn_cb _callback_references = {
     .connected = _transport_connected,
     .disconnected = _transport_disconnected,
     .le_param_req = _le_param_req,
     .le_param_updated = _le_param_updated,
+#if defined(CONFIG_BT_PHY_UPDATE)
     .le_phy_updated = _le_phy_updated,
+#endif
+#if defined(CONFIG_BT_DATA_LEN_UPDATE)
     .le_data_len_updated = _le_data_length_updated,
+#endif
 };
 
 //
@@ -558,7 +592,11 @@ static bool read_from_tx_queue()
                      tx_buffer,
                      (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)); // It always fits completely or not at all
     if (tx_buffer_size != (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)) {
-        LOG_ERR("Failed to read from ring buffer. not enough data %d", tx_buffer_size);
+        // P8: demoted from LOG_ERR to LOG_DBG. In deferred log mode this is a
+        // normal transient condition (pusher spins faster than codec fills the
+        // ring buffer) and the old error flooded the log pipe with thousands
+        // of messages/sec, hiding real errors. BLE audio path unaffected.
+        LOG_DBG("Failed to read from ring buffer. not enough data %d", tx_buffer_size);
         return false;
     }
 
@@ -766,6 +804,13 @@ void pusher(void)
                 }
                 k_mutex_unlock(&write_sdcard_mutex);
             }
+            if (!is_sd_on() && !ring_buf_is_empty(&ring_buf)) {
+                // No SD card: discard stale audio frames so the ring buffer never fills.
+                // A full ring buffer triggers an error-log flood (LOG_MODE_IMMEDIATE, ~100Hz)
+                // that starves the main thread and causes a watchdog reset while a central
+                // is connected but not yet subscribed (e.g. slow Windows GATT discovery).
+                read_from_tx_queue();
+            }
             if (result) {
                 heartbeat_count++;
                 if (heartbeat_count == 255) {
@@ -775,6 +820,14 @@ void pusher(void)
                 }
             } else {
             }
+        }
+        if (!valid && !is_sd_on() && !ring_buf_is_empty(&ring_buf)) {
+            // storage_is_on is set true by the connected callback, so the branch above
+            // is skipped while connected-but-not-subscribed (e.g. slow Windows GATT
+            // discovery). That also leaves the ring buffer undrained. Discard stale
+            // frames in EVERY unsubscribed state when no SD card is present, or the
+            // error-log flood starves the CPU and the watchdog resets mid-discovery.
+            read_from_tx_queue();
         }
         if (valid) {
             bool sent = push_to_gatt(conn);
@@ -845,6 +898,7 @@ int transport_start()
 
     // Configure callbacks
     bt_conn_cb_register(&_callback_references);
+    bt_gatt_cb_register(&_gatt_callbacks);
 
     // Enable Bluetooth
     int err = bt_enable(NULL);
