@@ -13,7 +13,7 @@
             compatible = "zephyr,sdmmc-disk";
             status = "okay";
         };
-        spi-max-frequency = <24000000>;  // 24 MHz SPI speed for SD card
+        spi-max-frequency = <1000000>;  // P13b: 1 MHz bring-up - 24 MHz is not reliable over fly wires
     };
 };
 &pinctrl {
