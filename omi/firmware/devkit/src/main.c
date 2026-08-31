@@ -217,7 +217,7 @@ int main(void)
     // Firmware version fingerprint: printed at boot AND shown as blue LED
     // blink count, so the running build can be verified beyond doubt even
     // when the log pipe dies later. Bump on every patch!
-    LOG_INF("FW VERSION: P13C\n");
+    LOG_INF("FW VERSION: P13D\n");
 
     LOG_INF("Model: %s", CONFIG_BT_DIS_MODEL);
     LOG_INF("Firmware revision: %s", CONFIG_BT_DIS_FW_REV_STR);
@@ -241,9 +241,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 15 times = patch 13c. Visible without any
+    // Version blink: blue LED blinks 16 times = patch 13d. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 15; i++) {
+    for (int i = 0; i < 16; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
