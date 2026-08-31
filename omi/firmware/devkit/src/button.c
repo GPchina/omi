@@ -490,7 +490,12 @@ void activate_button_work()
 
 void register_button_service()
 {
-    bt_gatt_service_register(&button_service);
+    int err = bt_gatt_service_register(&button_service);
+    if (err) {
+        LOG_ERR("Failed to register button service (err %d)", err);
+    } else {
+        LOG_INF("Button service registered");
+    }
 }
 
 FSM_STATE_T get_current_button_state()
