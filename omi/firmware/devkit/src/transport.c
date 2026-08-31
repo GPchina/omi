@@ -919,9 +919,24 @@ int transport_start()
 
     // Start advertising
     memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4);
-    bt_gatt_service_register(&storage_service);
-    bt_gatt_service_register(&audio_service);
-    bt_gatt_service_register(&dfu_service);
+    err = bt_gatt_service_register(&storage_service);
+    if (err) {
+        LOG_ERR("Failed to register storage service (err %d)", err);
+    } else {
+        LOG_INF("Storage service registered");
+    }
+    err = bt_gatt_service_register(&audio_service);
+    if (err) {
+        LOG_ERR("Failed to register audio service (err %d)", err);
+    } else {
+        LOG_INF("Audio service registered");
+    }
+    err = bt_gatt_service_register(&dfu_service);
+    if (err) {
+        LOG_ERR("Failed to register DFU service (err %d)", err);
+    } else {
+        LOG_INF("DFU service registered");
+    }
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {
         LOG_ERR("Transport advertising failed to start (err %d)", err);
