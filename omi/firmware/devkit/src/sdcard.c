@@ -44,7 +44,11 @@ int mount_sd_card(void)
     // peripheral enabled in the v1-spisd overlay (qspi_default uses P0.19 as
     // SCK) - configuring it as a GPIO output fought the QSPI pinctrl.
     LOG_PRINTK("[SD] step 1/4: sd_en skipped (not present on fly-wire module)\n");
-    sd_enabled = true;
+    // P13c fix: sd_enabled must ONLY be set once the FULL mount chain succeeds.
+    // It previously was set true up front; any later failure left is_sd_on()==true,
+    // so manual recording tried to write to an unmounted card -> "fs: invalid file
+    // name!!" / "mount point not found" error flood on every audio frame.
+    // sd_enabled = true;  <-- REMOVED, set at the successful return below.
 
     // initialize the sd card
     LOG_PRINTK("[SD] step 2/4: disk_access_init (SPI probe - may block here)\n");
@@ -129,6 +133,11 @@ int mount_sd_card(void)
     }
 
     LOG_INF("result of check: %d", res);
+
+    // P13c fix: card is truly mounted & audio dir ready now - only then report
+    // SD as available so is_sd_on() gates recording writes correctly.
+    sd_enabled = true;
+    LOG_PRINTK("[SD] SD card fully mounted, sd_enabled=true\n");
 
     return 0;
 }
