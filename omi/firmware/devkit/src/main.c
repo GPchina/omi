@@ -56,19 +56,30 @@ static void sd_mount_thread_fn(void *p1, void *p2, void *p3)
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
 
-    int err = mount_sd_card();
-    if (err) {
-        // Degrade, never abort: BLE + button keep working, manual recording
-        // just won't write anything until a card mounts.
-        LOG_ERR("SD mount failed (err %d) - continuing WITHOUT storage", err);
-        return;
-    }
-
-    k_msleep(500);
-    LOG_INF("Initializing storage...\n");
-    err = storage_init();
-    if (err) {
-        LOG_ERR("storage_init failed (err %d)", err);
+    // P13c: retry the mount periodically instead of giving up. A card that
+    // wasn't seated (or a cold SD module on USB power) will start answering
+    // once power/re-seating is fixed, and the card should mount without a
+    // reboot. Logs a line on each transition so the serial tells us clearly.
+    bool reported_failure = false;
+    while (1) {
+        int err = mount_sd_card();
+        if (!err) {
+            if (reported_failure) {
+                LOG_INF("SD mount OK (recovered)\n");
+            }
+            k_msleep(500);
+            LOG_INF("Initializing storage...\n");
+            err = storage_init();
+            if (err) {
+                LOG_ERR("storage_init failed (err %d)", err);
+            }
+            return;  // storage ready; worker thread exits
+        }
+        if (!reported_failure) {
+            LOG_ERR("SD mount failed (err %d) - retrying every 5s (BLE stays up)", err);
+            reported_failure = true;
+        }
+        k_msleep(5000);
     }
 }
 #endif
@@ -206,7 +217,7 @@ int main(void)
     // Firmware version fingerprint: printed at boot AND shown as blue LED
     // blink count, so the running build can be verified beyond doubt even
     // when the log pipe dies later. Bump on every patch!
-    LOG_INF("FW VERSION: P13B\n");
+    LOG_INF("FW VERSION: P13C\n");
 
     LOG_INF("Model: %s", CONFIG_BT_DIS_MODEL);
     LOG_INF("Firmware revision: %s", CONFIG_BT_DIS_FW_REV_STR);
@@ -230,9 +241,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 14 times = patch 13b. Visible without any
+    // Version blink: blue LED blinks 15 times = patch 13c. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 14; i++) {
+    for (int i = 0; i < 15; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
