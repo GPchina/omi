@@ -102,13 +102,16 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
                                            uint16_t offset)
 {
     k_msleep(10);
-    // P14: 返回 11 个 uint32 = [10个文件大小] + [offset]
+    // P14b: GATT 读回调运行在 BT 线程上下文，绝不能做文件 IO（get_offset 读
+    // info.txt）。挂载线程若正持有 FAT 锁做 SPI 传输，这里的 fs_open 会经
+    // 优先级继承把卡住的挂载线程提升到 BT 优先级，足以饿死主循环喂狗，
+    // 触发 30s watchdog 复位循环（实测：读 INFO 立即断连 + Reset by WATCHDOG）。
+    // 正确做法：offset 槽由 transport.c 的 update_file_size()（pusher 线程，
+    // 安全上下文）预填 file_num_array[10]，这里只读纯内存数组。
     uint32_t amount[11] = {0};
     for (int i = 0; i < 11; i++) {
         amount[i] = file_num_array[i];
     }
-    // 确保 offset 槽有值（若 transport 未填则读 info.txt）
-    amount[10] = get_offset();
     ssize_t result = bt_gatt_attr_read(conn, attr, buf, len, offset, amount, 11 * sizeof(uint32_t));
     return result;
 }
