@@ -758,6 +758,9 @@ void update_file_size()
     for (int i = 0; i < MAX_AUDIO_FILES; i++) {
         file_num_array[i] = get_file_size(i + 1);
     }
+    // P14b: offset 槽在这里预填（pusher 线程上下文，可安全做文件 IO），
+    // storage_read_characteristic 只读内存，不在 BT 线程碰 FAT 锁。
+    file_num_array[10] = (uint32_t) get_offset();
     // LOG_PRINTK("file size for file count %d %d\n",file_count,file_num_array[0]);
     // LOG_PRINTK("offset for file count %d %d\n",file_count,file_num_array[1]);
 }
@@ -803,7 +806,11 @@ void pusher(void)
         // offline; that drains the battery and fills the card with silence.
         if (!valid && !storage_is_on && manual_record_on) {
             bool result = false;
-            if (file_num_array[1] < MAX_STORAGE_BYTES) {
+            // P14b: 检查"当前写入文件"（file_count 对应）的大小护栏。
+            // P13f 这里用 file_num_array[1]（旧协议的 offset 槽）；P14 数组
+            // 重排后 [1] 是 a02 的大小，改用 [file_count-1] 保持语义。
+            if (file_count >= 1 && file_count <= MAX_AUDIO_FILES &&
+                file_num_array[file_count - 1] < MAX_STORAGE_BYTES) {
                 k_mutex_lock(&write_sdcard_mutex, K_FOREVER);
                 if (is_sd_on()) {
                     result = write_to_storage();
