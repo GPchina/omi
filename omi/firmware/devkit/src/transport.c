@@ -804,7 +804,19 @@ void pusher(void)
         // P13: only persist to SD while a manual recording is active
         // (button single tap). Official firmware wrote continuously whenever
         // offline; that drains the battery and fills the card with silence.
-        if (!valid && !storage_is_on && manual_record_on) {
+        //
+        // P14c: 手动录音优先级最高 —— 只要 manual_record_on 就写卡，与 BLE
+        // 连接态/订阅态无关。原条件 !valid && !storage_is_on 有致命缺陷：
+        // storage_is_on 是"连接态+文件订阅态"的混合标志（transport.c:434/479
+        // 置 true/false，storage.c:88 也置 true），PC 连上蓝牙传文件（未订阅
+        // audio 流）时 valid=false 且 storage_is_on=true，导致既不写卡也不
+        // 流式，录音数据被白白丢弃（实测：插 USB + 蓝牙连着传文件时按按钮
+        // 录音，TF 卡 10 个文件全 0）。
+        //
+        // 新语义：手动录音中 → 只要没在实时流式（!valid），一律写卡；
+        // 若正在实时流式（valid，有中心订阅了 audio），仍走 push_to_gatt
+        // 不写卡（避免重复，且实时监听场景不需要落盘）。
+        if (manual_record_on && !valid) {
             bool result = false;
             // P14b: 检查"当前写入文件"（file_count 对应）的大小护栏。
             // P13f 这里用 file_num_array[1]（旧协议的 offset 槽）；P14 数组
