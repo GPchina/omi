@@ -262,13 +262,17 @@ int write_to_file(uint8_t *data, uint32_t length)
 
 int initialize_audio_file(uint8_t num)
 {
+    // P14c: 修复 use-after-free —— 原来先 k_free(header) 再 create_file(header)，
+    // create_file 内部 snprintf 会读已释放的 header 内存，路径字符串是垃圾数据，
+    // fs_open 失败导致文件创建失败（start_new_recording 连锁失败，录音不落盘）。
+    // 正确顺序：先 create_file（会复制 header 到 current_full_path），再释放。
     char *header = generate_new_audio_header(num);
     if (header == NULL) {
         return -1;
     }
+    int rc = create_file(header);
     k_free(header);
-    create_file(header);
-    return 0;
+    return rc;
 }
 
 char *generate_new_audio_header(uint8_t num)
