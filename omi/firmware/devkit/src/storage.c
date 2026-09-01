@@ -56,7 +56,7 @@ K_THREAD_STACK_DEFINE(storage_stack, 4096);
 static struct k_thread storage_thread;
 
 extern uint8_t file_count;
-extern uint32_t file_num_array[2];
+extern uint32_t file_num_array[11];   // P14: [0..9]=10个文件大小, [10]=offset
 void broadcast_storage_packet(struct k_work *work_item);
 
 static struct bt_gatt_attr storage_service_attr[] = {
@@ -102,11 +102,14 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
                                            uint16_t offset)
 {
     k_msleep(10);
-    uint32_t amount[2] = {0};
-    for (int i = 0; i < 2; i++) {
+    // P14: 返回 11 个 uint32 = [10个文件大小] + [offset]
+    uint32_t amount[11] = {0};
+    for (int i = 0; i < 11; i++) {
         amount[i] = file_num_array[i];
     }
-    ssize_t result = bt_gatt_attr_read(conn, attr, buf, len, offset, amount, 2 * sizeof(uint32_t));
+    // 确保 offset 槽有值（若 transport 未填则读 info.txt）
+    amount[10] = get_offset();
+    ssize_t result = bt_gatt_attr_read(conn, attr, buf, len, offset, amount, 11 * sizeof(uint32_t));
     return result;
 }
 
