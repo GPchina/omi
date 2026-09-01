@@ -361,7 +361,10 @@ void storage_write(void)
                 }
             }
         }
-        k_yield();
+        // P14b: same starvation fix as transport.c pusher - k_yield() never
+        // yields to lower-priority threads; k_msleep(1) does (and lets the
+        // SD mount thread finish even when this thread is idle-spinning).
+        k_msleep(1);
     }
 }
 
