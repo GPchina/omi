@@ -228,6 +228,12 @@ void check_button_level(struct k_work *work_item)
         bool rec = !is_manual_recording();
         set_manual_recording(rec);
         LOG_PRINTK("manual recording %s\n", rec ? "ON" : "OFF");
+        // P14: 开始录音时分配一个新编号文件（a01, a02, ...），使每次录音独立成文件，
+        // 支持多文件同步。函数在 sdcard.c 实现（devkit 原版 sdcard.h 未声明，故 extern）。
+        extern int start_new_recording(void);
+        if (rec) {
+            start_new_recording();
+        }
 #endif
 
         // P11: visible feedback so taps are observable even with no app connected
