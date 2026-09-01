@@ -852,7 +852,14 @@ void pusher(void)
             bt_conn_unref(conn);
         }
 
-        k_yield();
+        // P14b: k_yield() only hands the CPU to threads of the SAME or higher
+        // priority. As the sole PREEMPT(7) thread it span the CPU forever and
+        // starved the K_LOWEST (31) SD mount thread: the 500ms head start at
+        // pusher boot was its ONLY window - a slow disk_access_init (>500ms,
+        // flaky fly-wired card) meant the mount never completed and no mount
+        // logs ever appeared. k_msleep(1) yields to ALL lower-priority threads
+        // too, while adding at most 1ms latency to the 10ms audio cadence.
+        k_msleep(1);
     }
 }
 extern struct bt_gatt_service storage_service;
