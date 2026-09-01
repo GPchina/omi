@@ -31,7 +31,8 @@ static char current_full_path[MAX_PATH_LENGTH];
 static char read_buffer[MAX_PATH_LENGTH];
 static char write_buffer[MAX_PATH_LENGTH];
 
-uint32_t file_num_array[2];
+#define MAX_AUDIO_FILES 10
+uint32_t file_num_array[MAX_AUDIO_FILES + 1];   // [0..9]=10文件大小, [10]=offset 预留
 
 static const char *disk_mount_pt = "/SD:/";
 
@@ -99,14 +100,15 @@ int mount_sd_card(void)
     initialize_audio_file(1);
     struct fs_dirent file_count_entry;
     file_count = get_file_contents(&audio_dir_entry, &file_count_entry);
-    file_count = 1;
-    if (file_count < 0) {
-        LOG_ERR(" error getting file count");
-        return -1;
+    // P14: 不再强制覆盖为 1 —— 保留目录里实际文件数，实现多文件录音。
+    // get_file_contents() 返回目录中的文件个数；已有文件数决定下一个可用编号。
+    if (file_count < 1) {
+        file_count = 1;   // 目录为空或错误，从 a01 开始
     }
-
+    if (file_count > MAX_AUDIO_FILES) {
+        file_count = MAX_AUDIO_FILES;   // clamp 到上限
+    }
     fs_closedir(&audio_dir_entry);
-    // file_count++;
     LOG_INF("new num files: %d", file_count);
 
     res = move_write_pointer(file_count);
@@ -199,6 +201,34 @@ int create_file(const char *file_path)
     return 0;
 }
 
+// P14: 开始一次新的手动录音 —— 分配下一个可用编号文件并切换写指针。
+// 策略：优先使用"空文件/已删除"的空闲编号（file_num_array[i]==0），
+//       这样永远不会覆盖还有未上传数据的文件（未上传的坚决不删）。
+//       若所有编号都非空（极少见），回绕到 1 覆盖最旧的（多为已上传、PC 已删）。
+int start_new_recording(void)
+{
+    // 1. 尝试找一个 size==0 的空闲编号（已上传被删 / 从未使用）
+    uint8_t target = 0;
+    for (uint8_t i = 1; i <= MAX_AUDIO_FILES; i++) {
+        if (file_num_array[i - 1] == 0) {
+            target = i;
+            break;
+        }
+    }
+    // 2. 没有空闲编号：从当前 file_count 递增，到上限回绕到 1（覆盖最旧）
+    if (target == 0) {
+        target = (file_count % MAX_AUDIO_FILES) + 1;
+    }
+    file_count = target;
+    LOG_PRINTK("[P14] start recording -> file a%02u.txt\n", file_count);
+    int rc = initialize_audio_file(file_count);
+    if (rc) {
+        LOG_ERR("[P14] init file failed: %d", rc);
+        return rc;
+    }
+    return move_write_pointer(file_count);
+}
+
 int read_audio_data(uint8_t *buf, int amount, int offset)
 {
     struct fs_file_t read_file;
@@ -280,6 +310,9 @@ int get_file_contents(struct fs_dir_t *zdp, struct fs_dirent *entry)
     while (zdp->mp->fs->readdir(zdp, entry) == 0) {
         if (entry->name[0] == 0) {
             break;
+        }
+        if (count >= MAX_AUDIO_FILES) {
+            break;   // P14: 防止 file_num_array 越界（最多记录 MAX_AUDIO_FILES 个）
         }
         file_num_array[count] = entry->size;
         LOG_INF("file numarray %d %d ", count, file_num_array[count]);
