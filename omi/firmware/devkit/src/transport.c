@@ -26,10 +26,12 @@
 LOG_MODULE_REGISTER(transport, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define MAX_STORAGE_BYTES 0xFFFF0000
+#define MAX_AUDIO_FILES 10
 extern bool is_connected;
 extern bool storage_is_on;
 extern uint8_t file_count;
-extern uint32_t file_num_array[2];
+// P14: file_num_array[0..9] = a01..a10 文件大小, [10] = 预留 offset
+extern uint32_t file_num_array[MAX_AUDIO_FILES + 1];
 struct bt_conn *current_connection = NULL;
 uint16_t current_mtu = 0;
 uint16_t current_package_index = 0;
@@ -750,8 +752,12 @@ static int recent_file_size_updated = 0;
 static uint8_t heartbeat_count = 0;
 void update_file_size()
 {
-    file_num_array[0] = get_file_size(1);
-    file_num_array[1] = get_offset();
+    // P14: 更新所有 10 个文件的大小到 file_num_array[0..9]。
+    // 不存在的文件 get_file_size() 返回 0（fs_stat 失败），
+    // 这样 BLE 端能一次拿到全部文件大小，识别新录音。
+    for (int i = 0; i < MAX_AUDIO_FILES; i++) {
+        file_num_array[i] = get_file_size(i + 1);
+    }
     // LOG_PRINTK("file size for file count %d %d\n",file_count,file_num_array[0]);
     // LOG_PRINTK("offset for file count %d %d\n",file_count,file_num_array[1]);
 }
