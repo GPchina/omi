@@ -144,8 +144,17 @@ int mount_sd_card(void)
     res = fs_stat(info_path, &info_file_entry); // for later
     if (res) {
         res = create_file("info.txt");
-        save_offset(0);
         LOG_INF("result of info.txt creation: %d ", res);
+    }
+
+    // P14f: 无条件清零读偏移。P14c use-after-free 时期可能把垃圾字节写进 info.txt，
+    // 使 get_offset() 读到 0x49445541("AUDI") 这种巨量偏移；PC 端下载时据此发 READ
+    // size=该偏移，会被固件判 "requested size is too large" 拒绝，录音无法下载。
+    // 这里每次挂载都清零，保证 INFO 的 offset 字段恒有效（下载进度不跨复位保留，
+    // 本项目手动录音场景可接受）。
+    res = save_offset(0);
+    if (res) {
+        LOG_ERR("reset offset failed: %d", res);
     }
 
     LOG_INF("result of check: %d", res);
