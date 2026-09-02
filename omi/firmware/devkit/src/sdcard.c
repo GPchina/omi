@@ -39,6 +39,9 @@ static const char *disk_mount_pt = "/SD:/";
 
 bool sd_enabled = false;
 
+// P14e: 前向声明。scan_audio_files 定义在 mount_sd_card 之后，需在此声明。
+static int scan_audio_files(void);
+
 int mount_sd_card(void)
 {
     // P13b: skip the sd_en (P0.19) pin on this fly-wire build. The module has
@@ -93,33 +96,33 @@ int mount_sd_card(void)
 
     if (res == FR_OK) {
         LOG_INF("audio directory created successfully");
-        initialize_audio_file(1);
     } else if (res == FR_EXIST) {
         LOG_INF("audio directory already exists");
     } else {
-        LOG_INF("audio directory creation failed: %d", res);
+        LOG_INF("audio directory creation result: %d", res);
     }
 
-    struct fs_dir_t audio_dir_entry;
-    fs_dir_t_init(&audio_dir_entry);
-    err = fs_opendir(&audio_dir_entry, "/SD:/audio");
-    if (err) {
-        LOG_ERR("error while opening directory ", err);
-        return -1;
-    }
-    LOG_INF("result of opendir: %d", err);
-    initialize_audio_file(1);
-    struct fs_dirent file_count_entry;
-    file_count = get_file_contents(&audio_dir_entry, &file_count_entry);
-    // P14: 不再强制覆盖为 1 —— 保留目录里实际文件数，实现多文件录音。
-    // get_file_contents() 返回目录中的文件个数；已有文件数决定下一个可用编号。
+    // P14e: 用 fs_stat 直接遍历固定槽位 a01~a10 重建 file_num_array，替代
+    // fs_opendir/fs_readdir 扫描。实测 readdir 在该飞线 SPI SD 环境下返回的
+    // 是根目录条目（audio/info.txt/a01.txt），把 file_count 误算成 3，随后
+    // move_write_pointer(3) 去 stat 不存在的 audio/a03.txt 而失败，导致
+    // sd_enabled 恒为 false、录音不落盘。直接 stat 命名文件走的是独立代码
+    // 路径（f_stat，非 f_opendir/f_readdir），绕开 readdir 的目录定位问题。
+    file_count = scan_audio_files();
     if (file_count < 1) {
-        file_count = 1;   // 目录为空或错误，从 a01 开始
+        file_count = 1;   // 目录为空，从 a01 开始
     }
     if (file_count > MAX_AUDIO_FILES) {
         file_count = MAX_AUDIO_FILES;   // clamp 到上限
     }
-    fs_closedir(&audio_dir_entry);
+
+    // 确保写指针槽位文件存在（空目录/空槽位则创建 0 字节占位文件），否则
+    // 下面的 move_write_pointer 会 stat 失败并提前 return。
+    res = initialize_audio_file(file_count);
+    if (res) {
+        LOG_ERR("init audio file %d failed: %d", file_count, res);
+        return -1;
+    }
     LOG_INF("new num files: %d", file_count);
 
     res = move_write_pointer(file_count);
@@ -335,6 +338,30 @@ int get_file_contents(struct fs_dir_t *zdp, struct fs_dirent *entry)
         count++;
     }
     return count;
+}
+
+// P14e: 用 fs_stat 遍历固定录音槽位 a01~a10 重建 file_num_array。
+// 返回最大已存在槽位编号（1..MAX_AUDIO_FILES），0 表示目录为空。
+// 相比 get_file_contents（依赖 fs_readdir），这里直接 stat 命名文件，
+// 绕开了 readdir 在该飞线 SPI SD 环境下返回根目录条目的问题。
+static int scan_audio_files(void)
+{
+    int max_used = 0;
+    for (uint8_t i = 1; i <= MAX_AUDIO_FILES; i++) {
+        char *header = generate_new_audio_header(i);
+        char path[MAX_PATH_LENGTH];
+        snprintf(path, sizeof(path), "%s%s", disk_mount_pt, header);
+        k_free(header);
+
+        struct fs_dirent entry;
+        if (fs_stat(path, &entry) == 0) {
+            file_num_array[i - 1] = entry.size;
+            max_used = i;
+        } else {
+            file_num_array[i - 1] = 0;
+        }
+    }
+    return max_used;
 }
 // we should clear instead of delete since we lose fifo structure
 int clear_audio_file(uint8_t num)
