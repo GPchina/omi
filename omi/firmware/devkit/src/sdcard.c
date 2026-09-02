@@ -1,5 +1,6 @@
 #include "sdcard.h"
 
+#include <errno.h>
 #include <ff.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
@@ -72,6 +73,16 @@ int mount_sd_card(void)
     int res = fs_mount(&mount_point);
     if (res == FR_OK) {
         LOG_PRINTK("[SD] mounted OK\n");
+    } else if (res == -EBUSY || res == -EEXIST) {
+        // P14d: "/SD:" is already mounted. This happens on a soft reset that
+        // retained the mount table in RAM, or when a previous mount attempt got
+        // past fs_mount but failed at a later step (opendir/move_write_pointer)
+        // and is being retried by the mount worker thread. The filesystem object
+        // is still registered and usable - so DON'T return -1 here. Returning -1
+        // skipped get_file_contents() entirely, which left file_num_array all-zero
+        // and made the BLE INFO characteristic report [0,...,0, 0xFFFFFFFF].
+        // Continuing re-runs the audio-dir scan below against the live mount.
+        LOG_PRINTK("[SD] already mounted (res=%d), continuing with scan\n", res);
     } else {
         LOG_ERR("f_mount failed: %d", res);
         return -1;
