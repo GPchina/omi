@@ -60,6 +60,11 @@ static volatile uint32_t rec_file_bytes = 0;    // bytes written to the current 
 // must NOT do filesystem IO (start_new_recording does fs_stat/fs_open), so it
 // only marks state here and the pusher thread performs the actual file switch.
 static volatile bool rec_needs_new_file = false;
+// Deferred finalize. Set on rec_stop() (IRQ context) so the pusher thread can
+// flush the buffered tail and write the true file size back to file_num_array.
+// Without this, start_new_recording() keeps finding the same "size==0" slot
+// offline and every auto-recording segment overwrites the previous one.
+static volatile bool rec_finalize_pending = false;
 
 // VAD: compare sum of squares against threshold^2 * count to avoid sqrt/float.
 // Threshold is RMS of the 16-bit PCM; 400 is a conservative speech level and
@@ -87,6 +92,7 @@ static void rec_stop(void)
 {
     rec_mode = REC_IDLE;
     rec_silence_ms = 0;
+    rec_finalize_pending = true;   // pusher will flush + refresh file size
 }
 
 bool is_recording(void)
@@ -850,6 +856,25 @@ void update_file_size()
     // LOG_PRINTK("offset for file count %d %d\n",file_count,file_num_array[1]);
 }
 
+// P15 fix: flush the current file's buffered Opus tail and record its true size
+// into file_num_array. Called from the pusher thread (safe to do FS IO) at three
+// points: (1) rec_stop() finalize, (2) truncation rotation, (3) new-recording
+// file allocation. Without this, start_new_recording() keeps finding the same
+// "size==0" slot offline (the array is only refreshed by update_file_size() on
+// BLE connect / by scan_audio_files() at mount), so every VAD segment and every
+// truncation re-selects a01 and recordings clobber each other, and the partial
+// 440-byte tail block leaks into the start of the next recording.
+static void finalize_current_file(void)
+{
+    if (buffer_offset > 0) {
+        write_to_file(storage_temp_data, buffer_offset);
+        buffer_offset = 0;
+    }
+    if (file_count >= 1 && file_count <= MAX_AUDIO_FILES) {
+        file_num_array[file_count - 1] = get_file_size(file_count);
+    }
+}
+
 void pusher(void)
 {
     k_msleep(500);
@@ -900,6 +925,8 @@ void pusher(void)
                     // from IRQ/button context and must run in this thread.
                     if (rec_needs_new_file) {
                         rec_needs_new_file = false;
+                        rec_finalize_pending = false;   // consume any pending stop-finalize
+                        finalize_current_file();        // flush old tail + record old size
                         start_new_recording();
                         rec_file_bytes = 0;
                     }
@@ -915,6 +942,7 @@ void pusher(void)
                         // Truncation: rotate to a fresh file when the current
                         // one reaches the size cap, keeping the recording going.
                         if (rec_file_bytes >= MAX_AUDIO_FILE_SIZE) {
+                            finalize_current_file();    // flush tail + record size of OLD file
                             start_new_recording();
                             rec_file_bytes = 0;
                         }
@@ -926,6 +954,19 @@ void pusher(void)
                 // No SD card: discard stale audio frames so the ring buffer never fills.
                 read_from_tx_queue();
             }
+        } else if (rec_finalize_pending) {
+            // P15: recording just stopped (rec_stop set this flag from IRQ/button
+            // context). Flush the buffered tail and refresh the file size so the
+            // next recording allocates a fresh slot instead of re-picking the one
+            // just written (the array is otherwise stale while fully offline).
+            k_mutex_lock(&write_sdcard_mutex, K_FOREVER);
+            if (is_sd_on()) {
+                finalize_current_file();
+            } else {
+                buffer_offset = 0;   // SD gone: discard the unflushable tail
+            }
+            k_mutex_unlock(&write_sdcard_mutex);
+            rec_finalize_pending = false;
         } else if (valid) {
             bool sent = push_to_gatt(conn);
             if (!sent) {
