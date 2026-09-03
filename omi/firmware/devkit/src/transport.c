@@ -173,8 +173,17 @@ void record_feed_pcm(const int16_t *samples, size_t count)
 bool should_capture_audio(void)
 {
     // Feed the transport pipeline only when the audio has somewhere to go:
-    // a BLE central (live stream) or an active recording (manual or auto).
-    return is_connected || is_recording();
+    // a BLE central (live stream) or an active recording (manual or auto) that
+    // actually has a mounted SD card to write to.
+    // P15d: also gate recording capture on is_sd_on(). When the card failed to
+    // mount (e.g. a brand-new unformatted card the fly-wire SPI cannot init),
+    // is_recording() can still be true (VAD/button) while there is NO consumer:
+    // the codec kept producing frames into the tx queue, which filled up, and
+    // the high-prio codec thread (P4) then starved the lower pusher thread (P7),
+    // flooding "tx queue after 3 retries". Drop those frames at the source
+    // instead. The recorder state machine keeps running, and capture resumes
+    // automatically the moment the card mounts (is_sd_on() flips true).
+    return is_connected || (is_recording() && is_sd_on());
 }
 
 //
