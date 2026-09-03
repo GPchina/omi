@@ -69,6 +69,16 @@ static volatile bool rec_finalize_pending = false;
 // auto recording latches on, so a single 100ms noise spike can't start REC_AUTO.
 static volatile uint8_t rec_voice_frames = 0;
 
+// P15f: audio-data notification subscription flag. Set/cleared in the CCC
+// handler and cleared again on disconnect, so the codec only produces frames
+// when a central has actually subscribed to the audio notifications. A central
+// that merely connects (e.g. the autosync file-transfer client) never enables
+// audio notify - without this flag, is_connected alone made the codec fill the
+// tx ring buffer and starve the lower-prio pusher, flooding "tx queue after 3
+// retries". Volatile: read from the codec thread, written from the BLE RX
+// context (single-core nRF52, aligned bool access is atomic).
+static volatile bool audio_notify_subscribed = false;
+
 // VAD: compare AC energy against an adaptively-calibrated noise floor.
 // P15e: the fixed 400 RMS threshold was too low for this PDM mic at MIC_GAIN=64
 // (+12 dB) - quiet-room noise already exceeded it, so VAD latched REC_AUTO the
@@ -220,17 +230,15 @@ void record_feed_pcm(const int16_t *samples, size_t count)
 bool should_capture_audio(void)
 {
     // Feed the transport pipeline only when the audio has somewhere to go:
-    // a BLE central (live stream) or an active recording (manual or auto) that
-    // actually has a mounted SD card to write to.
-    // P15d: also gate recording capture on is_sd_on(). When the card failed to
-    // mount (e.g. a brand-new unformatted card the fly-wire SPI cannot init),
-    // is_recording() can still be true (VAD/button) while there is NO consumer:
-    // the codec kept producing frames into the tx queue, which filled up, and
-    // the high-prio codec thread (P4) then starved the lower pusher thread (P7),
-    // flooding "tx queue after 3 retries". Drop those frames at the source
-    // instead. The recorder state machine keeps running, and capture resumes
-    // automatically the moment the card mounts (is_sd_on() flips true).
-    return is_connected || (is_recording() && is_sd_on());
+    //   - a central that SUBSCRIBED to the audio notifications (live stream), or
+    //   - an active recording (manual or auto) that has a mounted SD card.
+    // P15f: the previous `is_connected` gate was too loose - a central that
+    // connects but never enables audio notify (the autosync file-transfer
+    // client, or the gap between connect and subscribe) has no consumer for the
+    // codec output, so producing frames only filled the tx ring buffer and
+    // starved the lower-prio pusher thread, flooding "tx queue after 3 retries".
+    // Gate on the actual subscription instead.
+    return audio_notify_subscribed || (is_recording() && is_sd_on());
 }
 
 //
@@ -481,10 +489,19 @@ static const struct bt_data bt_sd[] = {
 
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
+    // P15f: track the audio-data subscription (attrs[2]) so the codec knows
+    // whether a live-stream consumer exists. The speaker CCC (attrs[5]) shares
+    // this handler but must NOT toggle audio capture.
     if (value == BT_GATT_CCC_NOTIFY) {
         LOG_INF("Client subscribed for notifications");
+        if (attr == &audio_service.attrs[2]) {
+            audio_notify_subscribed = true;
+        }
     } else if (value == 0) {
         LOG_INF("Client unsubscribed from notifications");
+        if (attr == &audio_service.attrs[2]) {
+            audio_notify_subscribed = false;
+        }
     } else {
         LOG_INF("Invalid CCC value: %u", value);
     }
@@ -646,6 +663,11 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 {
     is_connected = false;
     storage_is_on = false;
+    // P15f: CCC state is per-connection and cleared by the stack on disconnect
+    // without invoking the CCC write handler, so reset the subscription flag
+    // here - otherwise it would linger true and the next connect-without-
+    // subscribe would re-flood the tx queue.
+    audio_notify_subscribed = false;
 
     LOG_INF("Transport disconnected");
 
