@@ -39,6 +39,9 @@ static void codec_handler(uint8_t *data, size_t len)
 
 static void mic_handler(int16_t *buffer)
 {
+    // P15: VAD energy detection runs on the raw PCM, ahead of the codec, so
+    // auto (voice-activated) recording can trigger even while idle/standalone.
+    record_feed_pcm(buffer, MIC_BUFFER_SAMPLES);
     int err = codec_receive_pcm(buffer, MIC_BUFFER_SAMPLES);
     if (err) {
         LOG_ERR("Failed to process PCM data: %d", err);
@@ -177,10 +180,10 @@ void set_led_state()
         return;
     }
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-    // P13: manual recording indicator (standalone) - blink blue while
-    // recording to SD, distinguishable from idle (solid red) and from
-    // BLE-connected (solid blue).
-    if (!is_connected && is_manual_recording()) {
+    // P15: recording indicator - slow-blink blue while ANY recording (manual
+    // or auto-VAD) is active, independent of BLE state. Distinguishable from
+    // idle (solid red) and from BLE-connected live stream (solid blue).
+    if (is_recording()) {
         static bool rec_blink = false;
         rec_blink = !rec_blink;
         set_led_blue(rec_blink);
@@ -217,7 +220,7 @@ int main(void)
     // Firmware version fingerprint: printed at boot AND shown as blue LED
     // blink count, so the running build can be verified beyond doubt even
     // when the log pipe dies later. Bump on every patch!
-    LOG_INF("FW VERSION: P14F\n");
+    LOG_INF("FW VERSION: P15\n");
 
     LOG_INF("Model: %s", CONFIG_BT_DIS_MODEL);
     LOG_INF("Firmware revision: %s", CONFIG_BT_DIS_FW_REV_STR);
@@ -241,9 +244,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 24 times = patch 14f. Visible without any
+    // Version blink: blue LED blinks 25 times = patch 15. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < 25; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
