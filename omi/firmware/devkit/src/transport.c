@@ -69,10 +69,17 @@ static volatile bool rec_finalize_pending = false;
 // auto recording latches on, so a single 100ms noise spike can't start REC_AUTO.
 static volatile uint8_t rec_voice_frames = 0;
 
-// VAD: compare sum of squares against threshold^2 * count to avoid sqrt/float.
-// Threshold is RMS of the 16-bit PCM; 400 is a conservative speech level and
-// should be re-calibrated against the real mic once on hardware.
-#define VAD_RMS_THRESHOLD 400
+// VAD: compare AC energy against an adaptively-calibrated noise floor.
+// P15e: the fixed 400 RMS threshold was too low for this PDM mic at MIC_GAIN=64
+// (+12 dB) - quiet-room noise already exceeded it, so VAD latched REC_AUTO the
+// instant the mic started and the blue LED slow-blinked forever. Instead we
+// treat the first VAD_CALIB_BLOCKS (100ms each) after boot as a quiet baseline,
+// average their AC energy, and lock the threshold at VAD_SNR_RATIO x that noise
+// floor (clamped to VAD_MIN_THRESHOLD below). This adapts to the real mic gain
+// and room noise with no manual tuning.
+#define VAD_CALIB_BLOCKS 20        // 20 x 100ms = 2s calibration window
+#define VAD_SNR_RATIO 4            // voice must be >= 4x the noise RMS (~ +12 dB)
+#define VAD_MIN_THRESHOLD 400      // absolute floor, never go below
 // Auto recording ends after 10s of continuous silence.
 #define VAD_SILENCE_TIMEOUT_MS 10000
 // Consecutive voice frames required to start auto recording (100ms each).
@@ -80,6 +87,26 @@ static volatile uint8_t rec_voice_frames = 0;
 // Single-file truncation: ~30s @32kbps Opus (~4KB/s). Keeps each recording
 // short enough for fast medium-model transcription and BLE download.
 #define MAX_AUDIO_FILE_SIZE 120000
+
+// P15e: adaptive-threshold state. Calibration runs in the PDM IRQ context, so
+// keep these volatile like the other rec_* flags (single-core nRF52, 32-bit
+// aligned accesses are atomic).
+static volatile uint32_t vad_threshold = VAD_MIN_THRESHOLD;  // effective RMS threshold
+static volatile uint32_t calib_blocks = 0;                    // 100ms blocks collected
+static volatile uint64_t calib_sumsq = 0;                     // accumulated AC sumsq
+
+// integer square root of a uint64 (bit-by-bit, no float / libm).
+static uint32_t isqrt_u64(uint64_t n)
+{
+    uint32_t r = 0;
+    for (uint32_t bit = 1u << 31; bit != 0; bit >>= 1) {
+        uint32_t add = r | bit;
+        if ((uint64_t)add * add <= n) {
+            r = add;
+        }
+    }
+    return r;
+}
 
 extern int start_new_recording(void);   // sdcard.c (not in devkit sdcard.h)
 
@@ -142,7 +169,27 @@ void record_feed_pcm(const int16_t *samples, size_t count)
         int32_t s = (int32_t)samples[i] - mean;
         sumsq += (int64_t)s * s;
     }
-    bool voice = sumsq > (int64_t)VAD_RMS_THRESHOLD * VAD_RMS_THRESHOLD * (int64_t)count;
+    // P15e: calibrate the noise floor during the first VAD_CALIB_BLOCKS blocks
+    // (100ms each) after boot, then lock the threshold. No VAD decisions are
+    // made while calibrating so a quiet boot-up can never trigger REC_AUTO.
+    if (calib_blocks < VAD_CALIB_BLOCKS) {
+        calib_sumsq += (uint64_t)sumsq;
+        calib_blocks++;
+        if (calib_blocks == VAD_CALIB_BLOCKS) {
+            uint64_t mean_sumsq = calib_sumsq / ((uint64_t)count * VAD_CALIB_BLOCKS);
+            uint32_t noise_rms = isqrt_u64(mean_sumsq);
+            uint32_t thresh = noise_rms * VAD_SNR_RATIO;
+            if (thresh < VAD_MIN_THRESHOLD) {
+                thresh = VAD_MIN_THRESHOLD;
+            }
+            vad_threshold = thresh;
+            LOG_INF("VAD calibrated: noise_rms=%u threshold=%u",
+                    (unsigned)noise_rms, (unsigned)thresh);
+        }
+        return;
+    }
+
+    bool voice = sumsq > (int64_t)vad_threshold * (int64_t)vad_threshold * (int64_t)count;
 
     if (rec_mode == REC_MANUAL) {
         return;                        // manual mode: VAD has no say
