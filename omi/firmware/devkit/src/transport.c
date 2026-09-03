@@ -65,6 +65,9 @@ static volatile bool rec_needs_new_file = false;
 // Without this, start_new_recording() keeps finding the same "size==0" slot
 // offline and every auto-recording segment overwrites the previous one.
 static volatile bool rec_finalize_pending = false;
+// P15c: VAD start debounce - require this many consecutive voice frames before
+// auto recording latches on, so a single 100ms noise spike can't start REC_AUTO.
+static volatile uint8_t rec_voice_frames = 0;
 
 // VAD: compare sum of squares against threshold^2 * count to avoid sqrt/float.
 // Threshold is RMS of the 16-bit PCM; 400 is a conservative speech level and
@@ -72,6 +75,8 @@ static volatile bool rec_finalize_pending = false;
 #define VAD_RMS_THRESHOLD 400
 // Auto recording ends after 10s of continuous silence.
 #define VAD_SILENCE_TIMEOUT_MS 10000
+// Consecutive voice frames required to start auto recording (100ms each).
+#define VAD_START_DEBOUNCE_FRAMES 2
 // Single-file truncation: ~30s @32kbps Opus (~4KB/s). Keeps each recording
 // short enough for fast medium-model transcription and BLE download.
 #define MAX_AUDIO_FILE_SIZE 120000
@@ -116,10 +121,25 @@ void record_button_toggle(void)
 
 void record_feed_pcm(const int16_t *samples, size_t count)
 {
-    // Integer sum-of-squares energy; compare to threshold^2 * count (no sqrt).
+    if (count == 0) {
+        return;
+    }
+
+    // P15c: remove the PDM DC bias before energy detection. The raw mic output
+    // carries a DC offset; feeding raw sample^2 made sumsq always exceed the
+    // threshold (VAD fired the instant the mic started and silence never
+    // accumulated), so REC_IDLE was perpetually re-triggered into REC_AUTO and
+    // the blue LED blinked forever. Subtract the block mean, then measure AC
+    // energy and compare against threshold^2 * count (no sqrt / float).
+    int64_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sum += samples[i];
+    }
+    int32_t mean = (int32_t)(sum / (int64_t)count);
+
     int64_t sumsq = 0;
     for (size_t i = 0; i < count; i++) {
-        int32_t s = samples[i];
+        int32_t s = (int32_t)samples[i] - mean;
         sumsq += (int64_t)s * s;
     }
     bool voice = sumsq > (int64_t)VAD_RMS_THRESHOLD * VAD_RMS_THRESHOLD * (int64_t)count;
@@ -129,8 +149,14 @@ void record_feed_pcm(const int16_t *samples, size_t count)
     }
 
     if (rec_mode == REC_IDLE) {
+        // Debounce: only latch auto recording after a few consecutive voice
+        // frames, so a lone noise spike can't start the recorder.
         if (voice) {
-            rec_mark_start(REC_AUTO);  // first speech -> auto recording
+            if (++rec_voice_frames >= VAD_START_DEBOUNCE_FRAMES) {
+                rec_mark_start(REC_AUTO);
+            }
+        } else {
+            rec_voice_frames = 0;
         }
     } else if (rec_mode == REC_AUTO) {
         if (voice) {
@@ -813,8 +839,11 @@ uint32_t write_to_storage(void)
 
         storage_temp_data[buffer_offset] = tx_buffer_size;
         uint8_t *write_ptr = storage_temp_data;
-        write_to_file(write_ptr, MAX_WRITE_SIZE);
-        written = MAX_WRITE_SIZE;
+        // P15c: only count bytes when the write actually lands on the card.
+        // write_to_file() now returns 0 on success / negative errno on failure;
+        // treating every call as MAX_WRITE_SIZE made rec_file_bytes climb even
+        // when fs_open failed, spuriously triggering truncation + "drawing".
+        written = (write_to_file(write_ptr, MAX_WRITE_SIZE) == 0) ? MAX_WRITE_SIZE : 0;
 
         buffer_offset = packet_size;
         storage_temp_data[0] = tx_buffer_size;
@@ -825,8 +854,7 @@ uint32_t write_to_storage(void)
         memcpy(storage_temp_data + buffer_offset + 1, buffer, tx_buffer_size);
         buffer_offset = 0;
         uint8_t *write_ptr = (uint8_t *) storage_temp_data;
-        write_to_file(write_ptr, MAX_WRITE_SIZE);
-        written = MAX_WRITE_SIZE;
+        written = (write_to_file(write_ptr, MAX_WRITE_SIZE) == 0) ? MAX_WRITE_SIZE : 0;
 
     } else {
         storage_temp_data[buffer_offset] = tx_buffer_size;
