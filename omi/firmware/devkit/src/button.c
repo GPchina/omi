@@ -220,20 +220,14 @@ void check_button_level(struct k_work *work_item)
         notify_tap();
 
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-        // P13: single tap toggles a manual recording to the SD card.
-        // First tap starts recording (blue LED blinks while recording,
-        // driven by set_led_state in main.c); second tap stops it. Every
-        // audio packet is open/write/close'd in sdcard.c, so a stop (or
-        // even a hard power loss) never truncates what was already stored.
-        bool rec = !is_manual_recording();
-        set_manual_recording(rec);
-        LOG_PRINTK("manual recording %s\n", rec ? "ON" : "OFF");
-        // P14: 开始录音时分配一个新编号文件（a01, a02, ...），使每次录音独立成文件，
-        // 支持多文件同步。函数在 sdcard.c 实现（devkit 原版 sdcard.h 未声明，故 extern）。
-        extern int start_new_recording(void);
-        if (rec) {
-            start_new_recording();
-        }
+        // P15: single tap toggles MANUAL recording (start/stop). The unified
+        // recording state machine (manual / auto-VAD) lives in transport.c;
+        // a tap always starts or stops MANUAL recording, which follows the
+        // button on/off rule and is completely independent of voice (VAD).
+        // Blue LED slow-blinks while recording (driven by set_led_state in
+        // main.c). File allocation is deferred to the pusher thread.
+        record_button_toggle();
+        LOG_PRINTK("manual recording %s\n", is_recording() ? "ON" : "OFF");
 #endif
 
         // P11: visible feedback so taps are observable even with no app connected
