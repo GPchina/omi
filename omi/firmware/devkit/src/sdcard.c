@@ -277,9 +277,22 @@ int write_to_file(uint8_t *data, uint32_t length)
     struct fs_file_t write_file;
     fs_file_t_init(&write_file);
     uint8_t *write_ptr = data;
-    fs_open(&write_file, write_buffer, FS_O_WRITE | FS_O_APPEND);
-    fs_write(&write_file, write_ptr, length);
+    // P15c: propagate fs_open / fs_write errors instead of silently returning 0.
+    // The old code ignored both return values, so write_to_storage() could never
+    // learn a write failed - rec_file_bytes kept climbing on an unmounted card
+    // and truncation misfired, while Zephyr FATFS logged "file open error (-2)".
+    int rc = fs_open(&write_file, write_buffer, FS_O_WRITE | FS_O_APPEND);
+    if (rc) {
+        return rc;
+    }
+    ssize_t written = fs_write(&write_file, write_ptr, length);
     fs_close(&write_file);
+    if (written < 0) {
+        return (int) written;
+    }
+    if ((uint32_t) written != length) {
+        return -EIO;   // short write
+    }
     return 0;
 }
 
@@ -516,6 +529,13 @@ void sd_off()
 
 void sd_on()
 {
+    // P15c: power the module + configure the SPI pins ONLY. Do NOT set
+    // sd_enabled here - that flag must only be raised by mount_sd_card() once
+    // the full mount chain succeeds. bt_on() calls sd_on() unconditionally at
+    // boot/reconnect, which used to flip sd_enabled=true before any mount
+    // attempt; a failed/unmounted card then left is_sd_on()==true and the
+    // pusher kept fs_open-ing "/SD:/audio/..." on a non-existent mount point ->
+    // the "fs: file open error (-2)" flood.
     gpio_pin_set_dt(&sd_en_gpio_pin, 1);
     gpio_pin_configure(DEVICE_DT_GET(DT_NODELABEL(gpio1)), 15, GPIO_OUTPUT);     // MOSI
     gpio_pin_configure(DEVICE_DT_GET(DT_NODELABEL(gpio1)), 14, GPIO_INPUT);      // MISO
@@ -525,7 +545,6 @@ void sd_on()
     if (device_is_ready(spi_dev)) {
         pm_device_action_run(spi_dev, PM_DEVICE_ACTION_RESUME);
     }
-    sd_enabled = true;
 }
 
 bool is_sd_on()
