@@ -37,31 +37,112 @@ uint16_t current_mtu = 0;
 uint16_t current_package_index = 0;
 
 //
-// P13: manual (button-triggered) offline recording to the SD card.
+// P15: unified recording state machine (manual button / auto VAD).
 //
-// Official firmware writes ALL captured audio to the SD card whenever BLE is
-// not connected - continuously draining the battery and filling the card.
-// We gate it: audio is stored only while a manual recording is active,
-// toggled by a button single tap (see button.c). When a BLE central is
-// connected, audio streams over BLE as before and nothing hits the card.
+// Two recording modes, both persisting to the SD card regardless of BLE state:
+//   - REC_MANUAL: button-toggled (single tap start, single tap stop). VAD is
+//     completely ignored in this mode - it follows the button on/off rule.
+//   - REC_AUTO: voice-activated (VAD). Starts on first detected speech, ends
+//     after VAD_SILENCE_TIMEOUT_MS of continuous silence.
 //
-static bool manual_record_on = false;
+// The pusher writes to the SD card whenever a recording is active (manual or
+// auto), independent of BLE connection/subscription. Live BLE streaming only
+// happens when NO recording is active AND a central is subscribed.
+//
+// These are shared between the PDM IRQ context (record_feed_pcm), the button
+// work-queue thread (record_button_toggle) and the pusher thread - volatile so
+// the compiler re-reads them every time (single-core nRF52, 32-bit aligned
+// accesses are atomic; the bool is single-byte).
+static volatile rec_mode_t rec_mode = REC_IDLE;
+static volatile uint32_t rec_silence_ms = 0;    // auto-recording continuous-silence timer
+static volatile uint32_t rec_file_bytes = 0;    // bytes written to the current file (truncation)
+// Deferred file allocation. record_feed_pcm() runs in the PDM IRQ context and
+// must NOT do filesystem IO (start_new_recording does fs_stat/fs_open), so it
+// only marks state here and the pusher thread performs the actual file switch.
+static volatile bool rec_needs_new_file = false;
 
-bool is_manual_recording(void)
+// VAD: compare sum of squares against threshold^2 * count to avoid sqrt/float.
+// Threshold is RMS of the 16-bit PCM; 400 is a conservative speech level and
+// should be re-calibrated against the real mic once on hardware.
+#define VAD_RMS_THRESHOLD 400
+// Auto recording ends after 10s of continuous silence.
+#define VAD_SILENCE_TIMEOUT_MS 10000
+// Single-file truncation: ~30s @32kbps Opus (~4KB/s). Keeps each recording
+// short enough for fast medium-model transcription and BLE download.
+#define MAX_AUDIO_FILE_SIZE 120000
+
+extern int start_new_recording(void);   // sdcard.c (not in devkit sdcard.h)
+
+// Mark recording active + request a fresh file. Safe in any context: it only
+// flips flags; the actual start_new_recording() runs in the pusher thread.
+static void rec_mark_start(rec_mode_t mode)
 {
-    return manual_record_on;
+    rec_mode = mode;
+    rec_silence_ms = 0;
+    rec_file_bytes = 0;
+    rec_needs_new_file = true;
 }
 
-void set_manual_recording(bool on)
+static void rec_stop(void)
 {
-    manual_record_on = on;
+    rec_mode = REC_IDLE;
+    rec_silence_ms = 0;
+}
+
+bool is_recording(void)
+{
+    return rec_mode != REC_IDLE;
+}
+
+rec_mode_t get_rec_mode(void)
+{
+    return rec_mode;
+}
+
+void record_button_toggle(void)
+{
+    if (rec_mode == REC_MANUAL) {
+        rec_stop();                    // manual -> stop
+    } else {
+        rec_mark_start(REC_MANUAL);    // idle or auto -> (re)start manual
+    }
+}
+
+void record_feed_pcm(const int16_t *samples, size_t count)
+{
+    // Integer sum-of-squares energy; compare to threshold^2 * count (no sqrt).
+    int64_t sumsq = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t s = samples[i];
+        sumsq += (int64_t)s * s;
+    }
+    bool voice = sumsq > (int64_t)VAD_RMS_THRESHOLD * VAD_RMS_THRESHOLD * (int64_t)count;
+
+    if (rec_mode == REC_MANUAL) {
+        return;                        // manual mode: VAD has no say
+    }
+
+    if (rec_mode == REC_IDLE) {
+        if (voice) {
+            rec_mark_start(REC_AUTO);  // first speech -> auto recording
+        }
+    } else if (rec_mode == REC_AUTO) {
+        if (voice) {
+            rec_silence_ms = 0;
+        } else {
+            rec_silence_ms += 100;     // mic_handler cadence = 100ms
+            if (rec_silence_ms >= VAD_SILENCE_TIMEOUT_MS) {
+                rec_stop();
+            }
+        }
+    }
 }
 
 bool should_capture_audio(void)
 {
     // Feed the transport pipeline only when the audio has somewhere to go:
-    // a BLE central (live stream) or a manual SD recording.
-    return is_connected || manual_record_on;
+    // a BLE central (live stream) or an active recording (manual or auto).
+    return is_connected || is_recording();
 }
 
 //
@@ -708,14 +789,17 @@ static uint16_t buffer_offset = 0;
 //     return true;
 // }
 // for improving ble bandwidth
-bool write_to_storage(void)
+// Returns the number of bytes actually flushed to the SD card this call
+// (0 when the frame was only buffered and no file write happened yet).
+uint32_t write_to_storage(void)
 { // max possible packing
     if (!read_from_tx_queue()) {
-        return false;
+        return 0;
     }
 
     uint8_t *buffer = tx_buffer + 2;
     uint8_t packet_size = (uint8_t) (tx_buffer_size + OPUS_PREFIX_LENGTH);
+    uint32_t written = 0;
 
     // buffer_offset = buffer_offset+amount_to_fill;
     // check if adding the new packet will cause a overflow
@@ -724,6 +808,7 @@ bool write_to_storage(void)
         storage_temp_data[buffer_offset] = tx_buffer_size;
         uint8_t *write_ptr = storage_temp_data;
         write_to_file(write_ptr, MAX_WRITE_SIZE);
+        written = MAX_WRITE_SIZE;
 
         buffer_offset = packet_size;
         storage_temp_data[0] = tx_buffer_size;
@@ -735,6 +820,7 @@ bool write_to_storage(void)
         buffer_offset = 0;
         uint8_t *write_ptr = (uint8_t *) storage_temp_data;
         write_to_file(write_ptr, MAX_WRITE_SIZE);
+        written = MAX_WRITE_SIZE;
 
     } else {
         storage_temp_data[buffer_offset] = tx_buffer_size;
@@ -742,12 +828,11 @@ bool write_to_storage(void)
         buffer_offset = buffer_offset + packet_size;
     }
 
-    return true;
+    return written;
 }
 
 static bool use_storage = true;
 #define MAX_FILES 10
-#define MAX_AUDIO_FILE_SIZE 300000
 static int recent_file_size_updated = 0;
 static uint8_t heartbeat_count = 0;
 void update_file_size()
@@ -801,64 +886,56 @@ void pusher(void)
             valid = bt_gatt_is_subscribed(conn, &audio_service.attrs[1], BT_GATT_CCC_NOTIFY); // Check if subscribed
         }
 
-        // P13: only persist to SD while a manual recording is active
-        // (button single tap). Official firmware wrote continuously whenever
-        // offline; that drains the battery and fills the card with silence.
-        //
-        // P14c: 手动录音优先级最高 —— 只要 manual_record_on 就写卡，与 BLE
-        // 连接态/订阅态无关。原条件 !valid && !storage_is_on 有致命缺陷：
-        // storage_is_on 是"连接态+文件订阅态"的混合标志（transport.c:434/479
-        // 置 true/false，storage.c:88 也置 true），PC 连上蓝牙传文件（未订阅
-        // audio 流）时 valid=false 且 storage_is_on=true，导致既不写卡也不
-        // 流式，录音数据被白白丢弃（实测：插 USB + 蓝牙连着传文件时按按钮
-        // 录音，TF 卡 10 个文件全 0）。
-        //
-        // 新语义：手动录音中 → 只要没在实时流式（!valid），一律写卡；
-        // 若正在实时流式（valid，有中心订阅了 audio），仍走 push_to_gatt
-        // 不写卡（避免重复，且实时监听场景不需要落盘）。
-        if (manual_record_on && !valid) {
-            bool result = false;
+        // P15: any active recording (manual or auto) always writes to the SD
+        // card, independent of BLE connection/subscription - "recordings must
+        // land on the TF card regardless of BLE state". Live BLE streaming only
+        // happens when NO recording is active AND a central is subscribed.
+        if (is_recording()) {
             // P14b: 检查"当前写入文件"（file_count 对应）的大小护栏。
-            // P13f 这里用 file_num_array[1]（旧协议的 offset 槽）；P14 数组
-            // 重排后 [1] 是 a02 的大小，改用 [file_count-1] 保持语义。
             if (file_count >= 1 && file_count <= MAX_AUDIO_FILES &&
                 file_num_array[file_count - 1] < MAX_STORAGE_BYTES) {
                 k_mutex_lock(&write_sdcard_mutex, K_FOREVER);
                 if (is_sd_on()) {
-                    result = write_to_storage();
+                    // Deferred file switch: start_new_recording was requested
+                    // from IRQ/button context and must run in this thread.
+                    if (rec_needs_new_file) {
+                        rec_needs_new_file = false;
+                        start_new_recording();
+                        rec_file_bytes = 0;
+                    }
+                    uint32_t written = write_to_storage();
+                    if (written > 0) {
+                        rec_file_bytes += written;
+                        heartbeat_count++;
+                        if (heartbeat_count == 255) {
+                            update_file_size();
+                            heartbeat_count = 0;
+                            LOG_PRINTK("drawing\n");
+                        }
+                        // Truncation: rotate to a fresh file when the current
+                        // one reaches the size cap, keeping the recording going.
+                        if (rec_file_bytes >= MAX_AUDIO_FILE_SIZE) {
+                            start_new_recording();
+                            rec_file_bytes = 0;
+                        }
+                    }
                 }
                 k_mutex_unlock(&write_sdcard_mutex);
             }
             if (!is_sd_on() && !ring_buf_is_empty(&ring_buf)) {
                 // No SD card: discard stale audio frames so the ring buffer never fills.
-                // A full ring buffer triggers an error-log flood (LOG_MODE_IMMEDIATE, ~100Hz)
-                // that starves the main thread and causes a watchdog reset while a central
-                // is connected but not yet subscribed (e.g. slow Windows GATT discovery).
                 read_from_tx_queue();
             }
-            if (result) {
-                heartbeat_count++;
-                if (heartbeat_count == 255) {
-                    update_file_size();
-                    heartbeat_count = 0;
-                    LOG_PRINTK("drawing\n");
-                }
-            } else {
-            }
-        }
-        if (!valid && !is_sd_on() && !ring_buf_is_empty(&ring_buf)) {
-            // storage_is_on is set true by the connected callback, so the branch above
-            // is skipped while connected-but-not-subscribed (e.g. slow Windows GATT
-            // discovery). That also leaves the ring buffer undrained. Discard stale
-            // frames in EVERY unsubscribed state when no SD card is present, or the
-            // error-log flood starves the CPU and the watchdog resets mid-discovery.
-            read_from_tx_queue();
-        }
-        if (valid) {
+        } else if (valid) {
             bool sent = push_to_gatt(conn);
             if (!sent) {
                 // k_sleep(K_MSEC(50));
             }
+        } else if (!ring_buf_is_empty(&ring_buf)) {
+            // Not recording and not subscribed: audio has no consumer. Drain the
+            // ring buffer so it never fills up (a full ring buffer triggers an
+            // error-log flood that starves the CPU and resets the watchdog).
+            read_from_tx_queue();
         }
         if (conn) {
             bt_conn_unref(conn);
