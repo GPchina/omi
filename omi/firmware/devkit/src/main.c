@@ -244,9 +244,9 @@ int main(void)
         return err;
     }
 
-    // Version blink: blue LED blinks 25 times = patch 15. Visible without any
+    // Version blink: blue LED blinks 26 times = patch 15b. Visible without any
     // serial connection, distinguishes builds when flashing mistakes happen.
-    for (int i = 0; i < 25; i++) {
+    for (int i = 0; i < 26; i++) {
         set_led_blue(true);
         k_msleep(120);
         set_led_blue(false);
