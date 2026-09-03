@@ -56,19 +56,27 @@ int mount_sd_card(void)
     // sd_enabled = true;  <-- REMOVED, set at the successful return below.
 
     // initialize the sd card
+    // P15d: let a freshly-inserted / brand-new card stabilize its power rail
+    // before the first SPI probe. A new card can need a longer power-up ramp
+    // than a used one; probing too early returns -ETIMEDOUT (-116) even though
+    // the card is physically fine.
+    k_msleep(200);
     LOG_PRINTK("[SD] step 2/4: disk_access_init (SPI probe - may block here)\n");
     const char *disk_pdrv = "SD";
     int err = disk_access_init(disk_pdrv);
     LOG_PRINTK("[SD] disk_access_init: %d\n", err);
-    if (err) { // reattempt
-        k_msleep(1000);
-        LOG_PRINTK("[SD] step 2b: disk_access_init retry\n");
+    // P15d: retry a few times with growing backoff (was a single retry). A new
+    // card can fail its first couple of init sequences (CMD0/CMD8/ACMD41) and
+    // then settle. Still give up cleanly so the mount worker can retry later.
+    for (int attempt = 1; err && attempt <= 3; attempt++) {
+        k_msleep(attempt * 500);
+        LOG_PRINTK("[SD] step 2b: disk_access_init retry %d\n", attempt);
         err = disk_access_init(disk_pdrv);
-        LOG_PRINTK("[SD] disk_access_init retry: %d\n", err);
-        if (err) {
-            LOG_ERR("disk_access_init failed");
-            return -1;
-        }
+        LOG_PRINTK("[SD] disk_access_init retry %d: %d\n", attempt, err);
+    }
+    if (err) {
+        LOG_ERR("disk_access_init failed");
+        return -1;
     }
 
     LOG_PRINTK("[SD] step 3/4: fs_mount\n");
