@@ -87,13 +87,23 @@ static volatile bool audio_notify_subscribed = false;
 // average their AC energy, and lock the threshold at VAD_SNR_RATIO x that noise
 // floor (clamped to VAD_MIN_THRESHOLD below). This adapts to the real mic gain
 // and room noise with no manual tuning.
+//
+// P15g tuning: SNR ratio lowered (4 -> 3) and the absolute floor lowered
+// (400 -> 250) so normal-volume speech actually trips VAD in a moderately
+// noisy room. The start debounce is extended to 4 frames (400 ms) so a
+// short-duration burst (cough / sneeze / door slam, all <200ms) cannot latch
+// REC_AUTO on its own - voice has plenty of energy past 400ms, an impact does
+// not. Trade-off: the first ~300ms of an utterance may be clipped while the
+// debounce fills, but that is the right side of cough vs. missed-trigger.
 #define VAD_CALIB_BLOCKS 20        // 20 x 100ms = 2s calibration window
-#define VAD_SNR_RATIO 4            // voice must be >= 4x the noise RMS (~ +12 dB)
-#define VAD_MIN_THRESHOLD 400      // absolute floor, never go below
+#define VAD_SNR_RATIO 3            // voice must be >= 3x the noise RMS (~ +9.5 dB)
+#define VAD_MIN_THRESHOLD 250      // absolute floor, never go below
 // Auto recording ends after 10s of continuous silence.
 #define VAD_SILENCE_TIMEOUT_MS 10000
 // Consecutive voice frames required to start auto recording (100ms each).
-#define VAD_START_DEBOUNCE_FRAMES 2
+// P15g: 4 frames (400 ms) so single-frame impacts (coughs/sneezes, all
+// <200ms) cannot start REC_AUTO on their own.
+#define VAD_START_DEBOUNCE_FRAMES 4
 // Single-file truncation: ~30s @32kbps Opus (~4KB/s). Keeps each recording
 // short enough for fast medium-model transcription and BLE download.
 #define MAX_AUDIO_FILE_SIZE 120000
