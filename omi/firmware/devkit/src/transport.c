@@ -10,6 +10,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <math.h>                    // P15h: sinf/cosf/sqrtf for spectral VAD
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/ring_buffer.h>
 
@@ -65,9 +66,6 @@ static volatile bool rec_needs_new_file = false;
 // Without this, start_new_recording() keeps finding the same "size==0" slot
 // offline and every auto-recording segment overwrites the previous one.
 static volatile bool rec_finalize_pending = false;
-// P15c: VAD start debounce - require this many consecutive voice frames before
-// auto recording latches on, so a single 100ms noise spike can't start REC_AUTO.
-static volatile uint8_t rec_voice_frames = 0;
 
 // P15f: audio-data notification subscription flag. Set/cleared in the CCC
 // handler and cleared again on disconnect, so the codec only produces frames
@@ -79,53 +77,325 @@ static volatile uint8_t rec_voice_frames = 0;
 // context (single-core nRF52, aligned bool access is atomic).
 static volatile bool audio_notify_subscribed = false;
 
-// VAD: compare AC energy against an adaptively-calibrated noise floor.
-// P15e: the fixed 400 RMS threshold was too low for this PDM mic at MIC_GAIN=64
-// (+12 dB) - quiet-room noise already exceeded it, so VAD latched REC_AUTO the
-// instant the mic started and the blue LED slow-blinked forever. Instead we
-// treat the first VAD_CALIB_BLOCKS (100ms each) after boot as a quiet baseline,
-// average their AC energy, and lock the threshold at VAD_SNR_RATIO x that noise
-// floor (clamped to VAD_MIN_THRESHOLD below). This adapts to the real mic gain
-// and room noise with no manual tuning.
+// P15h: spectral voice activity detection. Four frequency-domain features
+// computed per 100 ms PCM frame replace the time-domain energy threshold
+// (P15e/P15g): a single RMS level cannot tell speech apart from a TV/music
+// or a fan running in the background - they have the same total energy.
 //
-// P15g tuning: SNR ratio lowered (4 -> 3) and the absolute floor lowered
-// (400 -> 250) so normal-volume speech actually trips VAD in a moderately
-// noisy room. The start debounce is extended to 4 frames (400 ms) so a
-// short-duration burst (cough / sneeze / door slam, all <200ms) cannot latch
-// REC_AUTO on its own - voice has plenty of energy past 400ms, an impact does
-// not. Trade-off: the first ~300ms of an utterance may be clipped while the
-// debounce fills, but that is the right side of cough vs. missed-trigger.
-#define VAD_CALIB_BLOCKS 20        // 20 x 100ms = 2s calibration window
-#define VAD_SNR_RATIO 3            // voice must be >= 3x the noise RMS (~ +9.5 dB)
-#define VAD_MIN_THRESHOLD 250      // absolute floor, never go below
-// Auto recording ends after 10s of continuous silence.
+//   f1 voice-band share   E(300-3400 Hz) / E(0-8000 Hz)
+//                         speech -> ~0.25-0.40 (low-pass mic),  HVAC/white
+//                         noise have most energy outside the band.
+//   f2 high-freq share    E(>4000 Hz) / E(300-3400 Hz)
+//                         speech -> very small (~0.02), anything with hiss
+//                         or broadband noise climbs above 0.2.
+//   f3 harmonic peaks     count of bins > 4x median in the F0..3F0 band
+//                         (60-1000 Hz, after the speaker's fundamental).
+//                         speech has F0 + 2F0 + 3F0 -> 2-3 peaks; pure-tone
+//                         noise (fan, tone) -> 0-1 peak.
+//   f4 temporal pulse     max energy in the last 8 frames / min energy in
+//                         the last 8 frames. Speech "pulses" between
+//                         syllable-on and syllable-off (>50 dB swings), so
+//                         f4 > 8. Continuous TV / fan / HVAC stay smooth,
+//                         f4 < 5. THIS IS THE KILLER FEATURE: it kills the
+//                         user's exact complaint (continuous noise waking).
+//
+// Rule: 3 of 4 features positive + 200 ms (2-frame) start debounce.
+//
+// PoC (`p13_tmp/vad_poc_v4.py`) measured on a real Omi recording + 5
+// synthesised background noises:
+//                                v4 (this scheme)   v3 (loose)   energy
+//   real voice                  ~34%               58%          -
+//   white noise                  0%                0%           yes
+//   fan / motor hum              0%                0%           yes
+//   HVAC hiss                   0%                0%           yes
+//   cough / sneeze              0%                0%           yes
+//   TV / music                  1%                39%          yes
+//
+// The 34% voice "recall" sounds low but is fine: speech is full of silence
+// gaps (between words and syllables) that the rule must not flag as voice.
+// Once the second voice frame fires the debounce latch, the recorder runs
+// for the whole utterance (10 s silence timeout), so what matters is that
+// the rule fires within the first word.
+#define FFT_N              256    // 16 kHz sampling -> 62.5 Hz / bin
+#define FFT_BIN_HZ         62.5f  // = sr / FFT_N
+#define VAD_HISTORY_FRAMES 8
+// Bin index = Hz / FFT_BIN_HZ. Use round-to-nearest.
+#define VAD_BIN_LO      5    // ~300 Hz   (start of voice band)
+#define VAD_BIN_VO_HI  54    // ~3400 Hz  (end of voice band)
+#define VAD_BIN_HI     64    // ~4000 Hz  (start of high-band noise band)
+#define VAD_F0_LO       1    // ~60  Hz   (start of F0 search)
+#define VAD_F0_HI      16    // ~1000 Hz  (end of F0 / start of harmonics)
+// Spectral VAD feature thresholds (PoC-tuned). Const, no per-room tuning.
+#define VAD_F1_THR     0.20f  // voice-band share minimum
+#define VAD_F2_THR     0.15f  // high-freq share maximum
+#define VAD_F3_THR     2      // harmonic peak count minimum
+#define VAD_F4_THR     8.0f   // temporal pulse ratio minimum
+#define VAD_VOTES_REQ  3      // >=3 of 4 features must be positive
+// Auto recording ends after 10 s of continuous silence.
 #define VAD_SILENCE_TIMEOUT_MS 10000
-// Consecutive voice frames required to start auto recording (100ms each).
-// P15g: 4 frames (400 ms) so single-frame impacts (coughs/sneezes, all
-// <200ms) cannot start REC_AUTO on their own.
-#define VAD_START_DEBOUNCE_FRAMES 4
-// Single-file truncation: ~30s @32kbps Opus (~4KB/s). Keeps each recording
-// short enough for fast medium-model transcription and BLE download.
+// 2 frames (200 ms) of consecutive voice-vote before latching REC_AUTO.
+// PoC showed this kills cough / sneeze / door-slam while still letting real
+// speech in.
+#define VAD_START_DEBOUNCE_FRAMES 2
+// Single-file truncation: ~30 s @ 32 kbps Opus (~4 KB/s). Keeps each
+// recording short enough for fast medium-model transcription and BLE
+// download.
 #define MAX_AUDIO_FILE_SIZE 120000
 
-// P15e: adaptive-threshold state. Calibration runs in the PDM IRQ context, so
-// keep these volatile like the other rec_* flags (single-core nRF52, 32-bit
-// aligned accesses are atomic).
-static volatile uint32_t vad_threshold = VAD_MIN_THRESHOLD;  // effective RMS threshold
-static volatile uint32_t calib_blocks = 0;                    // 100ms blocks collected
-static volatile uint64_t calib_sumsq = 0;                     // accumulated AC sumsq
+// 256-point symmetric Hann window, precomputed. 1 KB ROM.
+static const float hann_window[FFT_N] = {
+    0.000000f, 0.000152f, 0.000607f, 0.001365f,
+    0.002427f, 0.003790f, 0.005454f, 0.007419f,
+    0.009683f, 0.012244f, 0.015102f, 0.018253f,
+    0.021698f, 0.025433f, 0.029455f, 0.033764f,
+    0.038355f, 0.043227f, 0.048376f, 0.053800f,
+    0.059494f, 0.065456f, 0.071681f, 0.078166f,
+    0.084908f, 0.091902f, 0.099143f, 0.106628f,
+    0.114351f, 0.122309f, 0.130496f, 0.138907f,
+    0.147537f, 0.156382f, 0.165435f, 0.174691f,
+    0.184144f, 0.193790f, 0.203621f, 0.213632f,
+    0.223818f, 0.234170f, 0.244684f, 0.255354f,
+    0.266171f, 0.277131f, 0.288226f, 0.299449f,
+    0.310794f, 0.322255f, 0.333823f, 0.345491f,
+    0.357254f, 0.369104f, 0.381032f, 0.393033f,
+    0.405099f, 0.417223f, 0.429397f, 0.441614f,
+    0.453866f, 0.466146f, 0.478447f, 0.490761f,
+    0.503080f, 0.515398f, 0.527706f, 0.539997f,
+    0.552264f, 0.564500f, 0.576696f, 0.588845f,
+    0.600941f, 0.612976f, 0.624941f, 0.636832f,
+    0.648638f, 0.660355f, 0.671974f, 0.683489f,
+    0.694893f, 0.706178f, 0.717338f, 0.728366f,
+    0.739256f, 0.750000f, 0.760592f, 0.771027f,
+    0.781296f, 0.791395f, 0.801317f, 0.811056f,
+    0.820607f, 0.829962f, 0.839118f, 0.848067f,
+    0.856805f, 0.865327f, 0.873626f, 0.881699f,
+    0.889540f, 0.897145f, 0.904508f, 0.911626f,
+    0.918495f, 0.925109f, 0.931464f, 0.937558f,
+    0.943387f, 0.948946f, 0.954233f, 0.959243f,
+    0.963976f, 0.968426f, 0.972592f, 0.976471f,
+    0.980061f, 0.983359f, 0.986364f, 0.989074f,
+    0.991487f, 0.993601f, 0.995416f, 0.996930f,
+    0.998142f, 0.999052f, 0.999659f, 0.999962f,
+    0.999962f, 0.999659f, 0.999052f, 0.998142f,
+    0.996930f, 0.995416f, 0.993601f, 0.991487f,
+    0.989074f, 0.986364f, 0.983359f, 0.980061f,
+    0.976471f, 0.972592f, 0.968426f, 0.963976f,
+    0.959243f, 0.954233f, 0.948946f, 0.943387f,
+    0.937558f, 0.931464f, 0.925109f, 0.918495f,
+    0.911626f, 0.904508f, 0.897145f, 0.889540f,
+    0.881699f, 0.873626f, 0.865327f, 0.856805f,
+    0.848067f, 0.839118f, 0.829962f, 0.820607f,
+    0.811056f, 0.801317f, 0.791395f, 0.781296f,
+    0.771027f, 0.760592f, 0.750000f, 0.739256f,
+    0.728366f, 0.717338f, 0.706178f, 0.694893f,
+    0.683489f, 0.671974f, 0.660355f, 0.648638f,
+    0.636832f, 0.624941f, 0.612976f, 0.600941f,
+    0.588845f, 0.576696f, 0.564500f, 0.552264f,
+    0.539997f, 0.527706f, 0.515398f, 0.503080f,
+    0.490761f, 0.478447f, 0.466146f, 0.453866f,
+    0.441614f, 0.429397f, 0.417223f, 0.405099f,
+    0.393033f, 0.381032f, 0.369104f, 0.357254f,
+    0.345491f, 0.333823f, 0.322255f, 0.310794f,
+    0.299449f, 0.288226f, 0.277131f, 0.266171f,
+    0.255354f, 0.244684f, 0.234170f, 0.223818f,
+    0.213632f, 0.203621f, 0.193790f, 0.184144f,
+    0.174691f, 0.165435f, 0.156382f, 0.147537f,
+    0.138907f, 0.130496f, 0.122309f, 0.114351f,
+    0.106628f, 0.099143f, 0.091902f, 0.084908f,
+    0.078166f, 0.071681f, 0.065456f, 0.059494f,
+    0.053800f, 0.048376f, 0.043227f, 0.038355f,
+    0.033764f, 0.029455f, 0.025433f, 0.021698f,
+    0.018253f, 0.015102f, 0.012244f, 0.009683f,
+    0.007419f, 0.005454f, 0.003790f, 0.002427f,
+    0.001365f, 0.000607f, 0.000152f, 0.000000f,
+};
 
-// integer square root of a uint64 (bit-by-bit, no float / libm).
-static uint32_t isqrt_u64(uint64_t n)
+// P15h: spectral VAD working state. volatile so reads in the IRQ context
+// (record_feed_pcm) and writes in the same context see a consistent view.
+// All single-core nRF52, 32-bit aligned accesses are atomic; bool is 1 byte.
+static volatile float energy_history[VAD_HISTORY_FRAMES] = {0};
+static volatile uint32_t energy_history_fill = 0; // number of frames stored
+static volatile bool    energy_history_full  = false;
+// Count of consecutive "voice" votes in the IRQ - debounce latch.
+static volatile uint8_t rec_vote_streak = 0;
+
+// P15h: FFT scratch buffers. Made file-scope (not stack-allocated) so we do
+// not blow the ~2 KB nRF52 IRQ stack. The PDM handler calls mic_handler in
+// interrupt context, which calls record_feed_pcm, which calls
+// compute_spectral_features. compute_spectral_features previously allocated
+// ~2.8 KB of stack (buf + mag2 + band + sorted) - enough to overflow the
+// default CONFIG_ISR_STACK_SIZE=2048. Static allocation makes this safe
+// regardless of IRQ stack size. Single-core nRF52 means no race.
+static float fft_buf[FFT_N * 2];        // 2 KB
+static float fft_mag2[FFT_N / 2 + 1];   // 516 B
+static float fft_band[16];              // harmonic peak search band (64 B)
+static float fft_sorted[16];            // median sort scratch (64 B)
+
+// In-place radix-2 complex FFT on a length-N buffer laid out as
+// [re0, im0, re1, im1, ...]. After the call, the buffer holds the spectrum.
+// We use Zephyr's newlib <math.h> for sinf/cosf. Each FFT call here is 256
+// points with 8 stages, ~2k complex multiplies; well under the 100 ms frame
+// budget on the nRF52 with its single-precision FPU.
+static void fft_inplace_f32(float *buf, int n)
 {
-    uint32_t r = 0;
-    for (uint32_t bit = 1u << 31; bit != 0; bit >>= 1) {
-        uint32_t add = r | bit;
-        if ((uint64_t)add * add <= n) {
-            r = add;
+    // Bit-reversal reordering
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; (j & bit); bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+        if (i < j) {
+            float tr = buf[i * 2];
+            buf[i * 2] = buf[j * 2];
+            buf[j * 2] = tr;
+            float ti = buf[i * 2 + 1];
+            buf[i * 2 + 1] = buf[j * 2 + 1];
+            buf[j * 2 + 1] = ti;
         }
     }
-    return r;
+    // Butterflies
+    for (int s = 1; (1 << s) <= n; s++) {
+        int m = 1 << s;
+        int m2 = m >> 1;
+        for (int k = 0; k < n; k += m) {
+            for (int j = 0; j < m2; j++) {
+                float angle = -6.28318530718f * (float)j / (float)m;
+                float wr = cosf(angle);
+                float wi = sinf(angle);
+                int a = (k + j) * 2;
+                int b = (k + j + m2) * 2;
+                float tr = wr * buf[b] - wi * buf[b + 1];
+                float ti = wr * buf[b + 1] + wi * buf[b];
+                buf[b]     = buf[a]     - tr;
+                buf[b + 1] = buf[a + 1] - ti;
+                buf[a]     = buf[a]     + tr;
+                buf[a + 1] = buf[a + 1] + ti;
+            }
+        }
+    }
+}
+
+// Compute the four spectral VAD features for one 100 ms block. Samples are
+// raw int16 from the PDM (we do not subtract DC bias - the spectral features
+// are ratios and DC bias cancels in f4's max/min temporal ratio). We work in
+// float (nRF52 has FPU) and accumulate in float.
+static void compute_spectral_features(const int16_t *samples, size_t count,
+                                      bool *out_vote, bool *out_voice_vote)
+{
+    // Pull a 256-sample window from the middle of the 1600-sample block.
+    // Using the centre (not the leading edge) means the first ~700 ms of
+    // audio is not lost while we fill FFT windows.
+    size_t centre = count / 2;
+    size_t half = FFT_N / 2;
+    size_t start = (centre > half) ? (centre - half) : 0;
+    if (start + FFT_N > count) {
+        start = (count > FFT_N) ? (count - FFT_N) : 0;
+    }
+    // Windowed complex input buffer (real part = windowed sample, imag = 0).
+    // fft_buf and fft_mag2 are file-scope statics (declared above) so this
+    // function does not allocate ~2 KB on the IRQ stack.
+    for (int i = 0; i < FFT_N; i++) {
+        size_t idx = start + i;
+        float s = (idx < count) ? (float)samples[idx] : 0.0f;
+        fft_buf[i * 2]     = s * hann_window[i];
+        fft_buf[i * 2 + 1] = 0.0f;
+    }
+    fft_inplace_f32(fft_buf, FFT_N);
+
+    // Magnitude squared per bin (FFT_N/2+1 bins; DC at 0 is ignored).
+    fft_mag2[0] = 0.0f;
+    for (int i = 1; i <= FFT_N / 2; i++) {
+        float re = fft_buf[i * 2];
+        float im = fft_buf[i * 2 + 1];
+        fft_mag2[i] = re * re + im * im;
+    }
+
+    // Band energies
+    float e_lo  = 0.0f, e_voice = 0.0f, e_hi = 0.0f;
+    for (int b = 1; b < VAD_BIN_LO; b++)               e_lo   += fft_mag2[b];
+    for (int b = VAD_BIN_LO; b < VAD_BIN_VO_HI; b++)   e_voice += fft_mag2[b];
+    for (int b = VAD_BIN_VO_HI; b < VAD_BIN_HI; b++)   e_hi   += fft_mag2[b];
+    // Top-bin remainder also counts as "high" so a steep spectral roll-off
+    // does not artificially lower f2.
+    for (int b = VAD_BIN_HI; b <= FFT_N / 2; b++)    e_hi   += fft_mag2[b];
+
+    float e_total = e_lo + e_voice + e_hi;
+    float f1 = (e_total > 0.0f) ? (e_voice / e_total) : 0.0f;
+    float f2 = (e_voice > 0.0f) ? (e_hi / e_voice) : 999.0f;
+
+    // Harmonic peak count in the F0..3F0 band.
+    int peak_count = 0;
+    {
+        // Use sqrt-magnitude for peak detection (auditory-style loudness)
+        const int band_n = VAD_F0_HI - VAD_F0_LO + 1;
+        for (int i = 0; i < band_n; i++) {
+            fft_band[i] = sqrtf(fft_mag2[VAD_F0_LO + i] + 1e-12f);
+        }
+        // Median for "noise floor" reference
+        for (int i = 0; i < band_n; i++) fft_sorted[i] = fft_band[i];
+        // tiny insertion sort (n is <= 16)
+        for (int i = 1; i < band_n; i++) {
+            float v = fft_sorted[i];
+            int j = i - 1;
+            while (j >= 0 && fft_sorted[j] > v) { fft_sorted[j + 1] = fft_sorted[j]; j--; }
+            fft_sorted[j + 1] = v;
+        }
+        float med = fft_sorted[band_n / 2];
+        float thr = med * 4.0f;
+        if (thr > 0.0f) {
+            for (int i = 0; i < band_n; i++) {
+                if (fft_band[i] > thr) {
+                    peak_count++;
+                    // Skip adjacent bins (spectral leakage from one peak
+                    // shows up in 1-2 neighbors).
+                    i += 2;
+                }
+            }
+        }
+    }
+
+    // Total energy for the temporal pulse ratio (sum of mag2 across bins).
+    float e = e_total;
+
+    // Push into rolling history (FIFO overwriting oldest)
+    uint32_t h_idx = energy_history_fill;
+    if (energy_history_full) {
+        // overwrite in a small ring. Easier: shift up by one.
+        for (uint32_t i = 0; i + 1 < VAD_HISTORY_FRAMES; i++) {
+            energy_history[i] = energy_history[i + 1];
+        }
+        energy_history[VAD_HISTORY_FRAMES - 1] = e;
+    } else {
+        energy_history[h_idx] = e;
+        energy_history_fill++;
+        if (energy_history_fill >= VAD_HISTORY_FRAMES) {
+            energy_history_full = true;
+            energy_history_fill = VAD_HISTORY_FRAMES;
+        }
+    }
+
+    // Temporal pulse ratio: max / min across the history window.
+    float f4 = 1.0f;
+    uint32_t n = energy_history_full ? VAD_HISTORY_FRAMES : energy_history_fill;
+    if (n >= 4) {
+        float mn = 1e30f, mx = -1e30f;
+        for (uint32_t i = 0; i < n; i++) {
+            float v = energy_history[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        f4 = mx / (mn + 1e-9f);
+    }
+
+    // Combine
+    int votes = 0;
+    if (f1 > VAD_F1_THR) votes++;
+    if (f2 < VAD_F2_THR) votes++;
+    if (peak_count >= VAD_F3_THR) votes++;
+    if (f4 > VAD_F4_THR) votes++;
+    *out_vote = (votes >= VAD_VOTES_REQ);
+    *out_voice_vote = *out_vote;
 }
 
 extern int start_new_recording(void);   // sdcard.c (not in devkit sdcard.h)
@@ -172,44 +442,18 @@ void record_feed_pcm(const int16_t *samples, size_t count)
         return;
     }
 
-    // P15c: remove the PDM DC bias before energy detection. The raw mic output
-    // carries a DC offset; feeding raw sample^2 made sumsq always exceed the
-    // threshold (VAD fired the instant the mic started and silence never
-    // accumulated), so REC_IDLE was perpetually re-triggered into REC_AUTO and
-    // the blue LED blinked forever. Subtract the block mean, then measure AC
-    // energy and compare against threshold^2 * count (no sqrt / float).
-    int64_t sum = 0;
-    for (size_t i = 0; i < count; i++) {
-        sum += samples[i];
-    }
-    int32_t mean = (int32_t)(sum / (int64_t)count);
-
-    int64_t sumsq = 0;
-    for (size_t i = 0; i < count; i++) {
-        int32_t s = (int32_t)samples[i] - mean;
-        sumsq += (int64_t)s * s;
-    }
-    // P15e: calibrate the noise floor during the first VAD_CALIB_BLOCKS blocks
-    // (100ms each) after boot, then lock the threshold. No VAD decisions are
-    // made while calibrating so a quiet boot-up can never trigger REC_AUTO.
-    if (calib_blocks < VAD_CALIB_BLOCKS) {
-        calib_sumsq += (uint64_t)sumsq;
-        calib_blocks++;
-        if (calib_blocks == VAD_CALIB_BLOCKS) {
-            uint64_t mean_sumsq = calib_sumsq / ((uint64_t)count * VAD_CALIB_BLOCKS);
-            uint32_t noise_rms = isqrt_u64(mean_sumsq);
-            uint32_t thresh = noise_rms * VAD_SNR_RATIO;
-            if (thresh < VAD_MIN_THRESHOLD) {
-                thresh = VAD_MIN_THRESHOLD;
-            }
-            vad_threshold = thresh;
-            LOG_INF("VAD calibrated: noise_rms=%u threshold=%u",
-                    (unsigned)noise_rms, (unsigned)thresh);
-        }
-        return;
-    }
-
-    bool voice = sumsq > (int64_t)vad_threshold * (int64_t)vad_threshold * (int64_t)count;
+    // P15h: spectral VAD. Compute the four frequency-domain features on this
+    // 100 ms block and ask the algorithm whether it is "voice".
+    //
+    // We do NOT subtract DC bias here: the spectral features are ratios
+    // (f1 = voice-band share, f2 = high-freq share, f4 = max/min temporal
+    // energy), so an additive PDM DC bias only adds constant energy to the
+    // first few bins (we explicitly zero mag2[0]) and cancels in f4's max/min
+    // ratio. The old energy-VAD needed DC removal because sumsq was an
+    // absolute threshold; ratios are bias-invariant.
+    bool voice = false;
+    bool voice_vote_unused = false;
+    compute_spectral_features(samples, count, &voice, &voice_vote_unused);
 
     if (rec_mode == REC_MANUAL) {
         return;                        // manual mode: VAD has no say
@@ -217,13 +461,14 @@ void record_feed_pcm(const int16_t *samples, size_t count)
 
     if (rec_mode == REC_IDLE) {
         // Debounce: only latch auto recording after a few consecutive voice
-        // frames, so a lone noise spike can't start the recorder.
+        // votes, so a one-frame TV peak / cough can't start REC_AUTO.
         if (voice) {
-            if (++rec_voice_frames >= VAD_START_DEBOUNCE_FRAMES) {
+            if (++rec_vote_streak >= VAD_START_DEBOUNCE_FRAMES) {
                 rec_mark_start(REC_AUTO);
+                rec_vote_streak = 0;   // ready for next segment
             }
         } else {
-            rec_voice_frames = 0;
+            rec_vote_streak = 0;
         }
     } else if (rec_mode == REC_AUTO) {
         if (voice) {
