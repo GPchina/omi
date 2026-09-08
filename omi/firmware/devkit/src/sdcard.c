@@ -267,8 +267,22 @@ int read_audio_data(uint8_t *buf, int amount, int offset)
     uint8_t *temp_ptr = buf;
     struct fs_dirent entry;
 
+    // P16: propagate fs_open / fs_seek errors instead of overwriting rc and
+    // charging ahead. The old code called fs_seek/fs_read on an uninitialized
+    // handle when fs_open failed, and returned fs_read's value regardless --
+    // which storage.c's write_to_gatt then ignored, resending a stale block.
+    // Same fix class as P15c's write_to_file.
     int rc = fs_open(&read_file, read_buffer, FS_O_READ | FS_O_RDWR);
+    if (rc < 0) {
+        LOG_ERR("read_audio_data: open %s failed (%d)", read_buffer, rc);
+        return rc;
+    }
     rc = fs_seek(&read_file, offset, FS_SEEK_SET);
+    if (rc < 0) {
+        LOG_ERR("read_audio_data: seek to %d failed (%d)", offset, rc);
+        fs_close(&read_file);
+        return rc;
+    }
     rc = fs_read(&read_file, temp_ptr, amount);
     // LOG_PRINTK("read data :");
     // for (int i = 0; i < amount;i++) {
