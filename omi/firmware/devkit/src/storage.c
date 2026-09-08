@@ -153,6 +153,15 @@ static int setup_storage_tx()
         remaining_length = get_file_size(file_count);
     }
 
+    // P16: same uint32_t underflow class as write_to_gatt. A saved offset that
+    // is >= the current file size (stale info.txt, file replaced by a shorter
+    // recording) made `remaining_length - offset` wrap to ~4e9 and the transfer
+    // ran off the end of the file forever.
+    if (offset >= remaining_length) {
+        LOG_INF("offset %u >= file size %u, nothing to send", offset, remaining_length);
+        remaining_length = 0;
+        return 0;
+    }
     remaining_length = remaining_length - offset;
 
     // offset=offset_;
@@ -275,18 +284,52 @@ static ssize_t storage_write_handler(struct bt_conn *conn,
 //     }
 // }
 
+// P16: consecutive bt_gatt_notify failures before we give up on the transfer.
+// Retrying is the right response to a transient "no buffers" error, but without
+// a cap a permanently failing notify would spin this thread forever.
+#define MAX_NOTIFY_FAIL_RUN 200
+static uint16_t notify_fail_run = 0;
+
 static void write_to_gatt(struct bt_conn *conn)
 { // unsafe. designed for max speeds. udp?
 
     uint32_t packet_size = MIN(remaining_length, SD_BLE_SIZE);
 
     int r = read_audio_data(storage_write_buffer, packet_size, offset);
-    offset = offset + packet_size;
+    // P16: read_audio_data returns fs_read's byte count (0 at EOF, <0 on error).
+    // The old code ignored it, so a failed/short read left the PREVIOUS block
+    // sitting in storage_write_buffer and bt_gatt_notify shipped it again --
+    // forever. Measured on 2026-09-08: one 440B block resent 1531 times in a
+    // single 690KB download, and status 100 was never sent.
+    if (r <= 0) {
+        LOG_PRINTK("read_audio_data eof/error at offset %u: %d\n", offset, r);
+        remaining_length = 0;  // storage_write() then notifies status 100
+        return;
+    }
+    if ((uint32_t) r < packet_size) {
+        packet_size = (uint32_t) r;
+    }
+
     int err = bt_gatt_notify(conn, &storage_service.attrs[1], &storage_write_buffer, packet_size);
     if (err) {
         LOG_PRINTK("error writing to gatt: %d\n", err);
+        // Do not advance offset/remaining_length: retry this same block next
+        // pass. The old code advanced offset even on failure, silently dropping
+        // the block while leaving remaining_length untouched.
+        if (++notify_fail_run >= MAX_NOTIFY_FAIL_RUN) {
+            LOG_PRINTK("gatt notify failed %u times in a row, aborting transfer\n", notify_fail_run);
+            notify_fail_run = 0;
+            remaining_length = 0;
+        }
     } else {
-        remaining_length = remaining_length - SD_BLE_SIZE;
+        notify_fail_run = 0;
+        offset = offset + packet_size;
+        // P16: subtract the ACTUAL packet size, not the fixed SD_BLE_SIZE.
+        // remaining_length is uint32_t, so on the final partial block (< 440B)
+        // `- SD_BLE_SIZE` underflowed to ~4e9. storage_write() only notifies
+        // status 100 when remaining_length hits EXACTLY 0, so after the
+        // underflow it never finished and never stopped.
+        remaining_length = remaining_length - packet_size;
     }
     // LOG_PRINTK("wrote to gatt %d\n",err);
 }
