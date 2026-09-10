@@ -35,11 +35,25 @@
 #define CODEC_OPUS_APPLICATION OPUS_APPLICATION_VOIP
 #define CODEC_OPUS_BITRATE 32000
 #define CODEC_OPUS_VBR 1 // Or 1
-// P17: 3 -> 5 (range 0-10). Low complexity costs quality at the same bitrate.
-// SILK also costs more CPU than CELT, so watch the serial log after flashing:
-// `codec_ring_full` / `pcm_fail` means the codec thread can no longer keep up
-// with the 10 ms frame cadence -- drop back to 3 (keeping VOIP) if so.
-#define CODEC_OPUS_COMPLEXITY 5
+// P17b: back to 3. P17 raised this to 5 at the same time as switching on SILK
+// and the board went into a watchdog reboot loop -- serial showed a clean boot
+// ("Device initialized successfully") followed by `Reset by WATCHDOG` every
+// ~30 s. SILK at 10 ms frames is already the expensive case (SILK is designed
+// for 20 ms, so 10 ms doubles its per-second cost), and complexity 5 on top of
+// that starved the watchdog feed on this 64 MHz single-core part.
+//
+// Two variables changed at once in P17, which is why this needed a second
+// round. P17b keeps VOIP/SILK -- the change that actually targets speech
+// quality -- and reverts only the complexity bump.
+//
+// If the watchdog still trips at complexity 3, SILK at 10 ms is simply too
+// expensive for nRF52840: revert CODEC_OPUS_APPLICATION to
+// RESTRICTED_LOWDELAY (P16 behaviour). Raising CODEC_PACKAGE_SAMPLES to 320
+// (20 ms) would make SILK far cheaper AND better, but it also changes
+// CODEC_OUTPUT_MAX_BYTES, the ring-buffer sizing, and the PC decoder's
+// hardcoded `duration = len(frames) * 0.01` -- a separate change, not to be
+// stacked on this one.
+#define CODEC_OPUS_COMPLEXITY 3
 #endif
 // P17: renamed CELT -> HYBRID to match what actually ships. Neither
 // CONFIG_OPUS_MODE_CELT nor CONFIG_OPUS_MODE_HYBRID is defined anywhere, so in
